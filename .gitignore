@@ -1,0 +1,62 @@
+# TRUSTNOW Platform — .gitignore
+# CRITICAL: Never commit secrets, keys, or large binary data
+
+# Secrets & credentials
+.env
+*.env
+.env.*
+secrets/
+vault-init.json
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Runtime data (large, generated)
+data/
+logs/
+*.log
+
+# Node.js
+node_modules/
+dist/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+htmlcov/
+
+# ML / AI model binaries (too large for git)
+*.onnx
+*.bin
+*.safetensors
+*.gguf
+*.ggml
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Compiled outputs
+*.o
+*.so
+*.dylib
+
+# Temporary
+tmp/
+temp/
