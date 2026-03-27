@@ -1,0 +1,30 @@
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: trustnow-kafka
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # KRaft — combined broker + controller mode (no Zookeeper)
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Storage
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: fjyPGsz3SjWOAqMVmdd2Hg
+      # Single-node settings
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      # Metadata log
+      KAFKA_METADATA_LOG_DIR: /var/lib/kafka/data
+    volumes:
+      - /opt/trustnowailabs/trustnow-ai-worker-stack/data/kafka/kraft:/var/lib/kafka/data
