@@ -577,9 +577,21 @@ TRUSTNOW is a fully enterprise-grade, multi-tenant Autonomous AI Worker Stack ta
 - Check 8: Voice API — GET /voices returns 40 voices, GET /voices/languages returns 18 ✅
 - Check 9: Piper models on disk — 7 × .onnx (EN×2, ES, FR, DE, IT, PT-BR) ✅
 - Check 10: Ollama responding — 3 models: qwen2:7b, mistral:7b, llama3.1:8b ✅
+- Check 10B: Ollama real-generation verified — llama3.1:8b returned 62 real inference tokens (not health ping): `curl -s http://localhost:11434/api/generate -d '{"model":"llama3.1:8b","prompt":"Reply with: Partition B operational","stream":false}'` → response: "**Partition B ONLINE**..." `"done":true,"eval_count":62` ✅
 - Check 11: systemd trustnow-ai-pipeline — active + enabled, 4 workers ✅
 
-### TASK 6 onwards ← NEXT STEP AFTER TASK 5
+**§5.9 — Schema Migration 001 ✅ COMPLETE**
+- File: `services/platform-api/src/database/migrate-001-task5-columns.sql`
+- Applied via PgBouncer :5433 — all 6 ALTER TABLE blocks in one transaction
+- agents: +post_call_webhook_url, +environment ✅
+- agent_configs: +35 columns (personality, LLM, timing, ASR, guardrails, RAG, overrides) ✅
+- agent_versions: +traffic_split_pct, +is_live (A/B testing support) ✅
+- conversations: +15 columns (handle_time_s, llm_cost_usd, llm_turns, evaluation_results, latency, operational fields) ✅
+- widget_configs: +expanded_behavior, +avatar_type, +include_www_variants, +allow_http_links ✅
+- auth_policies: +conversation_initiation_webhook_url, +post_call_webhook_url, +allowed_overrides ✅
+- main.py bug fixed: session_end UPDATE uses `ended_at` (was end_time) + `conversation_id` (was cid) ✅
+
+### TASK 6 onwards ← NEXT STEP
 - NestJS Platform API scaffold
 - FreeSWITCH + LiveKit telephony
 - Agent Configuration Module

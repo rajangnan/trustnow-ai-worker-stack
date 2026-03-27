@@ -396,11 +396,11 @@ async def session_end(cid: str):
 
                 cur.execute("""
                     UPDATE conversations
-                    SET end_time = %s,
+                    SET ended_at = %s,
                         handle_time_s = %s,
                         llm_cost_usd = %s,
                         llm_turns = %s
-                    WHERE cid = %s
+                    WHERE conversation_id = %s
                 """, (now, handle_time_s, llm_cost_usd, llm_turns, cid))
         conn.close()
         logger.info("[%s] Session flushed to PostgreSQL", cid)
