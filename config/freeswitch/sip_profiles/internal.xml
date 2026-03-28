@@ -1,0 +1,27 @@
+<profile name="internal">
+  <settings>
+    <param name="debug" value="0"/>
+    <param name="sip-ip" value="172.25.10.142"/>
+    <param name="rtp-ip" value="172.25.10.142"/>
+    <param name="ext-sip-ip" value="172.25.10.142"/>
+    <param name="ext-rtp-ip" value="172.25.10.142"/>
+    <param name="sip-port" value="5060"/>
+    <param name="tls" value="true"/>
+    <param name="tls-sip-port" value="5061"/>
+    <param name="tls-cert-dir" value="/etc/freeswitch/ssl"/>
+    <param name="rtp-timer-name" value="soft"/>
+    <param name="codec-prefs" value="PCMU,PCMA,G722"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="rtp-start-port" value="16384"/>
+    <param name="rtp-end-port" value="32768"/>
+    <param name="record-path" value="/var/lib/freeswitch/recordings"/>
+    <param name="record-format" value="%s.wav"/>
+    <param name="manage-presence" value="false"/>
+    <param name="sip-options-respond-503-on-busy" value="true"/>
+    <param name="session-timeout" value="1800"/>
+    <param name="dtmf-type" value="rfc2833"/>
+    <!-- Pass CID in User-to-User header on transfers (BRD-CC-008) -->
+    <param name="pass-callee-id" value="true"/>
+  </settings>
+  <gateways/>
+</profile>

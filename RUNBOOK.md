@@ -669,9 +669,86 @@ TRUSTNOW is a fully enterprise-grade, multi-tenant Autonomous AI Worker Stack ta
 - Templates DB: SELECT COUNT(*) FROM agent_templates → 21 (9 featured) ✅
 - systemd trustnow-platform-api: active ✅
 
-### TASK 7 onwards ← NEXT STEP
-- FreeSWITCH + LiveKit telephony
-- Agent Configuration Module
+### [2026-03-28] TASK 7 — TELEPHONY (FreeSWITCH + LiveKit — IMPL-001 §Task 7)
+**Status:** ✅ COMPLETE
+
+**§7.1 — FreeSWITCH Docker Install**
+- Config directories created: config/freeswitch/{dialplan,sip_profiles,autoload_configs,sounds/music,ssl}, data/recordings
+- Image pulled: safarov/freeswitch:latest (FreeSWITCH 1.10.12; primary ghcr.io/signalwire and drachtio images denied)
+- ESL password (64-char hex) generated and stored in Vault at secret/trustnow/freeswitch
+
+**§7.2–§7.4 — FreeSWITCH Configuration Files**
+- vars.xml: ESL password substituted from Vault; domain=172.25.10.142; RTP 16384-32768
+- freeswitch.xml: master config including vars.xml, autoload_configs/*.xml, dialplan/*.xml
+- event_socket.conf.xml: ESL listen-ip=127.0.0.1, listen-port=8021, loopback.auto ACL
+- sofia.conf.xml: required config (missing from spec — added to make mod_sofia load)
+- sip_profiles/internal.xml: SIP on 172.25.10.142:5060 (UDP/TCP) + :5061 (TLS); codecs PCMU,PCMA,G722; pass-callee-id=true (BRD-CC-008)
+- TLS: ssl/trustnow.crt+key combined to ssl/agent.pem (600)
+
+**§7.5 — MOH**
+- local_stream.conf.xml: streams from /usr/share/freeswitch/sounds/music/default, rate=8000, shuffle=true
+
+**§7.6 — Dialplan**
+- dialplan/trustnow_inbound.xml: inbound handler (CID via curl, UUI header, record_session, socket bridge), queue transfer (Option B), SIP transfer (Option A)
+
+**§7.7 — Modules**
+- modules.conf.xml: mod_sofia, mod_commands, mod_dptools, mod_event_socket, mod_local_stream, mod_native_file, mod_tone_stream, mod_curl, mod_xml_curl, mod_logfile, mod_console, mod_cdr_csv
+
+**§7.8 — Container Started**
+- docker compose up -d → container running; sofia status: internal profile RUNNING on :5060 and :5061 TLS
+- Note: Docker built-in healthcheck shows "unhealthy" (uses wrong default password) — FreeSWITCH fully operational
+
+**§7.9 — LiveKit v1.10.0**
+- Binary: livekit-server v1.10.0 installed to /usr/local/bin/livekit (v1.7.2 from spec not published; v1.10.0 used — latest stable 2026-03-23)
+- Vault: key_id=trustnow-livekit-key, key_secret (64-char hex) stored at secret/trustnow/livekit
+- config/livekit/config.yaml: port=7880, RTC UDP 50000-60000, node_ip=172.25.10.142
+- systemd livekit.service: active, auto-start on boot
+
+**§7.10–§7.11 — NestJS TelephonyModule**
+- services/platform-api/src/telephony/esl.service.ts: EventEmitter2-based ESL client, auth + event subscriptions (CHANNEL_ANSWER, CHANNEL_HANGUP, CHANNEL_BRIDGE, DTMF, DETECTED_SPEECH), auto-reconnect on error/close, transferCall/playMoh/stopMoh/startRecording/stopRecording helpers
+- services/platform-api/src/telephony/handoff.controller.ts: POST /handoff/execute — Option A (SIP) + Option B (Redis queue)
+- services/platform-api/src/telephony/handoff.service.ts: executeOptionA (SIP transfer via ESL + CID in UUI), executeOptionB (Redis RPUSH + PUBLISH to trustnow:handoff:notify)
+- services/platform-api/src/telephony/telephony.module.ts: EventEmitterModule.forRoot() + EslService + HandoffService + HandoffController
+- app.module.ts: TelephonyModule registered
+- Packages installed: ioredis@5.10.1, @nestjs-modules/ioredis@2.2.1, @nestjs/event-emitter@3.0.1
+- Systemd drop-ins: esl.conf (FREESWITCH_ESL_PASSWORD), redis.conf (REDIS_PASSWORD)
+
+**§7.12 — handoff_service.py**
+- services/ai-pipeline/handoff_service.py: execute_handoff() async REST call to /api/handoff/execute, check_handoff_conditions() for caller_request / keyword_detection / max_duration_exceeded triggers
+- httpx already installed in AI pipeline venv
+
+**§7.13 — Build + Restart**
+- npm run build → clean compile (no errors)
+- sudo systemctl restart trustnow-platform-api → active, running
+
+**Verification (12/12 PASS):**
+1. FreeSWITCH container: Up (running) ✅
+2. SIP :5060 UDP + TCP: listening on 172.25.10.142 ✅
+3. ESL :8021 localhost only: listening, not externally exposed ✅
+4. LiveKit service: active, :7880 listening ✅
+5. UFW UDP 50000-60000: ALLOW (LiveKit UDP) ✅
+6. Vault secrets: FreeSWITCH esl_password + LiveKit key_id confirmed ✅
+7. Platform API health: {"status":"ok"} ✅
+8. Handoff endpoint in Swagger: /handoff/execute found ✅
+9. ESL auth in logs: "ESL authenticated — subscribed to TRUSTNOW call events" ✅
+10. FreeSWITCH CRIT/FATAL errors: none ✅
+11. Recording directory: present and accessible ✅
+12. handoff_service.py import: execute_handoff + check_handoff_conditions OK ✅
+
+**Deferrals (per §7.16):**
+- DEFERRED-009: SBC/SRTP perimeter hardening — pre-go-live hardening phase
+- Per-tenant MOH: Task 12 (Human Agent Desktop)
+- LiveKit Python SDK in AI pipeline: Task 9
+- FreeSWITCH dialplan curl to /api/sessions/initiate: endpoint built in Task 9
+
+**Port map additions:**
+- FreeSWITCH SIP: 172.25.10.142:5060 (UDP/TCP) + :5061 (TLS)
+- FreeSWITCH ESL: 127.0.0.1:8021 (localhost only)
+- LiveKit: 0.0.0.0:7880 (HTTP/WS) + UDP 50000-60000 (RTP)
+
+### TASK 8 onwards ← NEXT STEP
+- Agent Configuration Module (Next.js + shadcn/ui — UI-SPEC-001.md §6.4, 10 tabs)
+- Human Agent Desktop
 - Voice pipeline end-to-end
 - Web Widget publisher
 

@@ -17,6 +17,7 @@ import { ConversationsModule } from './conversations/conversations.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { TestsModule } from './tests/tests.module';
+import { TelephonyModule } from './telephony/telephony.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
@@ -39,6 +40,7 @@ import { AppController } from './app.controller';
     AnalyticsModule,
     WebhooksModule,
     TestsModule,
+    TelephonyModule,
   ],
   controllers: [AppController],
   providers: [

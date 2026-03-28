@@ -1,0 +1,47 @@
+<include>
+  <context name="trustnow_inbound">
+
+    <!-- Inbound call handler: generate CID, start recording, bridge to AI pipeline -->
+    <extension name="trustnow_ai_handler">
+      <condition field="destination_number" expression="^(\d+)$">
+
+        <!-- Step 1: Generate CID via Platform API -->
+        <action application="curl" data="http://127.0.0.1:3001/api/sessions/initiate method=POST content-type=application/json body={'caller_ani':'${caller_id_number}','agent_id':'${destination_number}'}"/>
+        <action application="set" data="trustnow_cid=${curl_response_data}"/>
+
+        <!-- Step 2: Set User-to-User header for SIP transfers (BRD-CC-008) -->
+        <action application="set" data="sip_h_User-to-User=${trustnow_cid};encoding=ascii"/>
+
+        <!-- Step 3: Start call recording — file named by CID -->
+        <action application="record_session" data="/var/lib/freeswitch/recordings/${trustnow_cid}.wav"/>
+
+        <!-- Step 4: Log CID to channel variable for ESL event subscriptions -->
+        <action application="export" data="trustnow_cid=${trustnow_cid}"/>
+
+        <!-- Step 5: Bridge to AI pipeline (LiveKit WebRTC via REFER or direct audio inject) -->
+        <action application="answer"/>
+        <action application="playback" data="local_stream://default"/>
+        <action application="socket" data="127.0.0.1:8084 async full"/>
+
+      </condition>
+    </extension>
+
+    <!-- Human handoff transfer — internal TRUSTNOW queue (Option B) -->
+    <extension name="trustnow_queue_transfer">
+      <condition field="destination_number" expression="^queue-(.+)$">
+        <action application="set" data="sip_h_User-to-User=${trustnow_cid};encoding=ascii"/>
+        <action application="set" data="queue_name=$1"/>
+        <action application="socket" data="127.0.0.1:8084 async full"/>
+      </condition>
+    </extension>
+
+    <!-- External SIP transfer — Option A handoff to PBX/CCaaS -->
+    <extension name="trustnow_sip_transfer">
+      <condition field="destination_number" expression="^transfer-(.+)$">
+        <action application="set" data="sip_h_User-to-User=${trustnow_cid};encoding=ascii"/>
+        <action application="transfer" data="$1 XML trustnow_inbound"/>
+      </condition>
+    </extension>
+
+  </context>
+</include>
