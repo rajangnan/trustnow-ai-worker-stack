@@ -937,9 +937,12 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 | trustnow-kong (docker) | ✅ Up (healthy) | :8000/:8001/:8443 — routes registered; DB bootstrapped fresh |
 | trustnow-keycloak (docker) | ✅ Up | :8080 — dev mode, pg auth fixed |
 
+### Ops — Resolved Pre-Task-8
+
+- **netxmsd** — permanently uninstalled 2026-04-11. Was conflicting with Kong on :8000. Packages removed: netxms-server, netxms-agent, netxms-base, netxms-dbdrv-pgsql, netxms-dbdrv-sqlite3, netxms-release.
+- **Tomcat10** — permanently uninstalled 2026-04-11. Was conflicting with Keycloak on :8080. Packages removed: tomcat10, tomcat10-admin, tomcat10-common, libtomcat10-java.
+
 ### Carry-forward open items
-- **netxmsd** re-holds :8000 after server reboot — may need a permanent fix (firewall rule or netxms config change) to stop it binding :8000; coordinate with server team
-- **Tomcat10** re-enables itself after reboots — monitor and disable after any reboot
 - **Kong routes** — re-registered this session after DB bootstrap; if Kong DB is lost again routes must be re-registered via Admin API (:8001)
 - Vault auto-unseal: currently manual — consider cloud KMS auto-unseal for production
 - LiteLLM API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY etc.) must be injected as env vars when real keys are available
