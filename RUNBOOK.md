@@ -746,6 +746,66 @@ TRUSTNOW is a fully enterprise-grade, multi-tenant Autonomous AI Worker Stack ta
 - FreeSWITCH ESL: 127.0.0.1:8021 (localhost only)
 - LiveKit: 0.0.0.0:7880 (HTTP/WS) + UDP 50000-60000 (RTP)
 
+### [2026-04-11] ADDENDUM 4A — Database Schema Backfill (28 new tables)
+**Status:** ✅ COMPLETE
+
+**Objective:** Verify the live PostgreSQL instance has all 28 new tables added during the CO-BROWSING-DATA-001.md v3.0 translation. Run migrations for any missing.
+
+**Pre-condition fix (2026-04-11):** PostgreSQL was down since 2026-04-09 due to SSL key permissions error (`/etc/ssl/private/ssl-cert-snakeoil.key` had group/world access). Fixed with:
+```bash
+sudo chmod 640 /etc/ssl/private/ssl-cert-snakeoil.key
+sudo systemctl start postgresql@16-main
+```
+
+**Migration applied:** `services/platform-api/src/database/migrations/002_cobrowsing_additions.sql`
+- Idempotent (`CREATE TABLE IF NOT EXISTS`) — safe to re-run
+- All 28 new tables defined with RLS policies and appropriate indexes
+
+**Verification (2026-04-11):**
+```
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public';
+→ 48 tables (≥ 47 required ✅)
+```
+
+**All 28 new tables confirmed present:**
+agent_branches, agent_knowledge_base, agent_test_attachments, agent_tests, api_keys,
+batch_calls, batch_call_recipients, branch_versions, conversation_turns, data_collection_specs,
+environment_variable_values, environment_variables, evaluation_criteria, knowledge_base_docs,
+phone_numbers, stt_transcripts, test_folders, test_runs, tts_generations,
+webhook_delivery_log, webhook_endpoints, whatsapp_accounts, workflow_edges, workflow_nodes,
+workflow_versions, workspace_auth_connections, workspace_secrets, workspace_settings ✅
+
+**Base tables (20):** agent_configs, agent_templates, agent_test_folders, agent_versions, agents,
+audit_logs, auth_policies, conversations, handoff_policies, llm_models, llm_providers,
+recordings, roles, stt_providers, tenants, tools, tts_providers, users, voices, widget_configs
+
+---
+
+### [2026-04-11] ADDENDUM 5A — AI Pipeline Backfill (Two New Services)
+**Status:** ✅ COMPLETE
+
+**Objective:** Add `resolveEnvVars()` and the PII Redaction service to the FastAPI AI pipeline.
+
+**Files created:**
+- `services/ai-pipeline/src/env_var_service.py`
+  - `resolve_env_vars(text, tenant_id, environment, db_pool)` — async function
+  - Resolves `{{env.VAR_NAME}}` tokens against `environment_variables` + `environment_variable_values` tables
+  - Falls back to `production` value if no env-specific value exists (§20.4)
+  - Called from: system_prompt, first_message, tool webhook URL/headers, MCP server_url
+- `services/ai-pipeline/src/pii_redaction_service.py`
+  - `redact_pii(text)` — synchronous function
+  - Patterns: UK/IN phone numbers, E.164 international, payment card numbers, UK NI numbers, DOB formats, email addresses, NHS numbers
+  - Called after `conversation_turns` is populated, before writing `conversations.transcript_json`
+  - Only active when `agent_configs.pii_redaction_enabled = True`
+
+**Smoke tests (2026-04-11 — via venv/bin/python3):**
+```
+✅ env_var_service: ENV_VAR_PATTERN matches correctly (CRM_URL, CRM_KEY extracted)
+✅ pii_redaction_service: redaction OK → "Call me on [PHONE_NUMBER] or email [EMAIL]"
+```
+
+---
+
 ### [2026-04-11] ADDENDUM 6A — NestJS Platform API: 21 New Modules (§6.2D–§6.2X)
 **Status:** ✅ COMPLETE
 
