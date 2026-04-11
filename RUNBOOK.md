@@ -880,18 +880,53 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 
 ---
 
-### TASK 8 onwards ← NEXT STEP
-- Agent Configuration Module (Next.js + shadcn/ui — UI-SPEC-001.md §6.4, 10 tabs)
-- Human Agent Desktop
-- Voice pipeline end-to-end
-- Web Widget publisher
+### TASK 8 ← NEXT (awaiting Architect instruction)
+- **§8.1** Frontend scaffold: Next.js + TypeScript + Tailwind + shadcn/ui + dnd-kit + Zustand + React Query
+- **§8.2** Global layout: sidebar (Configure/Monitor/Deploy groups), top bar, breadcrumb — per UI-SPEC §6.1
+- **§8.3** Home/Dashboard page — per UI-SPEC §6.2
+- **§8.4** Agent List page — per UI-SPEC §6.3
+- **§8.5** Agent Config Module: all 10 tabs — per UI-SPEC §6.4
+- **§8.6** Voice Picker side sheet — per UI-SPEC §6.5
+- **§8.7** Voice Library page — per UI-SPEC §6.6
+- **§8.8** Knowledge Base global page — per UI-SPEC §6.7
+- **§8.9** Tools global page — per UI-SPEC §6.8
+- **§8.10** Verification
+- Human Agent Desktop (Task 9)
+- Voice pipeline end-to-end (Task 10)
+- Web Widget publisher (Task 11)
+
+**Pre-Task 8 prerequisites:**
+- Provision MinIO buckets: `trustnow-tts-generations` and `trustnow-stt-transcripts` (before TTS/STT modules go live)
+- Read UI-SPEC-001.md §6.1, §6.3, §6.4 (all 10 tabs), §6.5–§6.8 IN FULL before writing any component
+
+### Current service state (as of 2026-04-11)
+| Service | Status | Notes |
+|---------|--------|-------|
+| trustnow-platform-api (systemd) | ✅ active | NestJS on :3001, PgBouncer :5433 |
+| postgresql@16-main (systemd) | ✅ active | Restored 2026-04-11 (SSL key perms fix) |
+| trustnow-redis (docker) | ✅ Up | :6379 |
+| trustnow-minio (docker) | ✅ Up | :9000/:9001 |
+| trustnow-kafka (docker) | ✅ Up | KRaft mode |
+| trustnow-qdrant (docker) | ✅ Up | :6333 |
+| trustnow-litellm (docker) | ✅ Up | :4000 |
+| trustnow-freeswitch (docker) | ✅ Up (unhealthy healthcheck) | internal :5060/:5061, external :5080 |
+| trustnow-livekit (docker) | ✅ Up | :7880/:7881 |
+| trustnow-prometheus (docker) | ✅ Up | :9090 |
+| trustnow-grafana (docker) | ✅ Up | :3000 |
+| trustnow-loki (docker) | ✅ Up | :3100 |
+| trustnow-kong (docker) | ⚠️ Restarting | Auth failure vs PostgreSQL — kong DB user pwd issue; pre-existing since PG outage 2026-04-09 |
+| trustnow-keycloak (docker) | ⚠️ Restarting | Auth failure vs PostgreSQL — keycloak DB user pwd issue; pre-existing since PG outage 2026-04-09 |
+
+**Kong/Keycloak restart root cause:** PostgreSQL was down from 2026-04-09 to 2026-04-11 (SSL key perms). On restore, both services fail auth — likely `kong` and `keycloak` pg users need passwords reset or pg_hba reconfigured. Requires Architect sign-off before touching auth infrastructure.
 
 ### Carry-forward open items
+- **⚠️ Kong + Keycloak DB auth failing** — pg users `kong` and `keycloak` need password reset after PG outage; both containers restarting continuously
+- **⚠️ Provision MinIO buckets** — `trustnow-tts-generations` and `trustnow-stt-transcripts` not yet created
 - Vault auto-unseal: currently manual — consider cloud KMS auto-unseal for production
 - LiteLLM API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY etc.) must be injected as env vars when real keys are available
 - Keycloak start-dev mode → production mode before go-live
 - MinIO SSE-S3 encryption: requires Vault KMS integration (post-Task 3)
-- GitHub: main branch pushed, tracking origin/main ✅
+- GitHub: main branch pushed, tracking origin/main ✅ (latest: f8985b5)
 - Self-signed TLS cert: replace with Let's Encrypt or corporate CA before production
 - Kafka: migrated to KRaft mode (Zookeeper removed) — see Task 4B-KRaft entry below ✅
 - Vault: migrated to Raft storage (HA enabled) — see Task 4B-Raft entry below ✅ ⚠️ NEW vault-init.json — ARCHITECT MUST BACK UP IMMEDIATELY
