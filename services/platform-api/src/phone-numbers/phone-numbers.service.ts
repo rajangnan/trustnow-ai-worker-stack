@@ -1,4 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
 import { getPool } from '../database/db.provider';
 import { AuditService } from '../audit/audit.service';
 import { CreatePhoneNumberDto, AssignAgentDto } from './dto/phone-number.dto';
@@ -6,6 +8,9 @@ import axios from 'axios';
 
 @Injectable()
 export class PhoneNumbersService {
+  private readonly GATEWAY_DIR =
+    '/opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch/sip_profiles/external';
+
   constructor(private audit: AuditService) {}
 
   async findAll(tenantId: string) {
@@ -43,7 +48,7 @@ export class PhoneNumbersService {
         dto.agent_id || null,
       ],
     );
-    await this.eslReloadDialplan();
+    await this.upsertFreeSwitchGateway(rows[0]);
     await this.audit.log({
       tenant_id: tenantId, actor_id: actorId,
       action: 'phone_number.create', resource_type: 'phone_number', resource_id: rows[0].phone_number_id,
@@ -77,7 +82,7 @@ export class PhoneNumbersService {
       `UPDATE phone_numbers SET ${fields.join(', ')}, updated_at = NOW() WHERE phone_number_id = $${i} RETURNING *`,
       vals,
     );
-    if (dto.agent_id !== undefined) await this.eslReloadDialplan();
+    await this.upsertFreeSwitchGateway(rows[0]);
     await this.audit.log({
       tenant_id: tenantId, actor_id: actorId,
       action: 'phone_number.update', resource_type: 'phone_number', resource_id: id,
@@ -100,7 +105,6 @@ export class PhoneNumbersService {
         [dto.agent_id],
       );
     }
-    await this.eslReloadDialplan();
     return { agent_id: rows[0].agent_id, updated_at: rows[0].updated_at };
   }
 
@@ -111,7 +115,7 @@ export class PhoneNumbersService {
       [id, tenantId],
     );
     if (!rows.length) throw new NotFoundException('Phone number not found');
-    await this.eslReloadDialplan();
+    await this.removeFreeSwitchGateway(id);
     return { archived: true };
   }
 
@@ -134,38 +138,58 @@ export class PhoneNumbersService {
     };
   }
 
-  private async eslReloadDialplan() {
+  private async eslCommand(cmd: string): Promise<void> {
     try {
       const eslUrl = process.env.ESL_URL || 'http://127.0.0.1:8021';
-      await axios.post(`${eslUrl}/api/reloadxml`, {}, { timeout: 5000 });
+      await axios.post(`${eslUrl}/api/${cmd}`, {}, { timeout: 5000 });
     } catch (_) {
       // ESL may not be running in dev — non-fatal
     }
   }
 
-  async upsertFreeSwitchGateway(tenantId: string, phoneNumberId: string) {
-    const { rows } = await getPool().query(
-      'SELECT * FROM phone_numbers WHERE phone_number_id = $1 AND tenant_id = $2',
-      [phoneNumberId, tenantId],
-    );
-    if (!rows.length) throw new NotFoundException('Phone number not found');
-    const pn = rows[0];
-    if (!pn.outbound_address) return { skipped: true, reason: 'no outbound_address configured' };
+  /**
+   * Writes a FreeSWITCH gateway XML fragment for this phone number and
+   * signals FreeSWITCH to rescan. Called after every create/update of a
+   * phone_numbers row that has an outbound_address set.
+   *
+   * Gateway naming: tn_{first 12 chars of phone_number_id, no dashes}
+   * One gateway per phone number — no tenant-level collision risk.
+   */
+  async upsertFreeSwitchGateway(phoneNumber: Record<string, any>): Promise<void> {
+    if (!phoneNumber.outbound_address) return;
 
-    const gatewayXml = `<gateway name="trustnow_trunk_${phoneNumberId}">
-  <param name="username" value="${pn.sip_username || 'trustnow'}"/>
-  <param name="realm" value="${pn.outbound_address}"/>
-  <param name="proxy" value="${pn.outbound_address}"/>
-  <param name="register" value="true"/>
-  <param name="caller-id-in-from" value="true"/>
-</gateway>`;
+    const gatewayName = `tn_${phoneNumber.phone_number_id.replace(/-/g, '').substring(0, 12)}`;
+    const gatewayFile = path.join(this.GATEWAY_DIR, `${gatewayName}.xml`);
 
-    const fs = await import('fs/promises');
-    const path = await import('path');
-    const gwDir = '/opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch/sip_profiles/external';
-    await fs.mkdir(gwDir, { recursive: true });
-    await fs.writeFile(path.join(gwDir, `${phoneNumberId}.xml`), gatewayXml);
-    await this.eslReloadDialplan();
-    return { upserted: true, gateway: `trustnow_trunk_${phoneNumberId}` };
+    const gatewayXml = `<include>
+  <gateway name="${gatewayName}">
+    <param name="username" value="${phoneNumber.sip_username ?? ''}"/>
+    <param name="password" value=""/>
+    <param name="proxy" value="${phoneNumber.outbound_address}"/>
+    <param name="register" value="${phoneNumber.sip_username ? 'true' : 'false'}"/>
+    <param name="transport" value="${phoneNumber.outbound_transport ?? 'tls'}"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>`;
+
+    fs.mkdirSync(this.GATEWAY_DIR, { recursive: true });
+    fs.writeFileSync(gatewayFile, gatewayXml);
+
+    await this.eslCommand('reloadxml');
+    await this.eslCommand('sofia profile external rescan');
+  }
+
+  /**
+   * Removes the FreeSWITCH gateway config when a phone number is deleted.
+   */
+  async removeFreeSwitchGateway(phoneNumberId: string): Promise<void> {
+    const gatewayName = `tn_${phoneNumberId.replace(/-/g, '').substring(0, 12)}`;
+    const gatewayFile = path.join(this.GATEWAY_DIR, `${gatewayName}.xml`);
+
+    if (fs.existsSync(gatewayFile)) {
+      fs.unlinkSync(gatewayFile);
+      await this.eslCommand('reloadxml');
+      await this.eslCommand('sofia profile external rescan');
+    }
   }
 }

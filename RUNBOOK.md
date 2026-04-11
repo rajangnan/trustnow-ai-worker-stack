@@ -850,7 +850,35 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 - trustnow-widget-assets (already created in §6.2G)
 - trustnow-kb-docs (already created in §6.2K)
 
-**Addendum 7A (FreeSWITCH outbound SIP):** Not yet implemented. Required before BatchCallModule makeOutboundCall() goes live. Create config/freeswitch/sip_profiles/external.xml with trustnow_trunk gateway pointing to SIP carrier.
+---
+
+### [2026-04-11] Addendum 7A — FreeSWITCH Outbound SIP Gateway
+**Status:** ✅ COMPLETE
+
+**What was done:**
+- **Step 7A.1:** Created `config/freeswitch/sip_profiles/external/` directory (dynamic gateway fragment directory)
+- **Step 7A.1:** Created `config/freeswitch/sip_profiles/external.xml` — external Sofia SIP profile on port 5080 (172.25.10.142:5080), codecs PCMU/PCMA/G722, `<gateways>` block with `<X-PRE-PROCESS cmd="include" data="external/*.xml"/>` for dynamic per-phone-number gateway fragments
+- **Step 7A.2:** `sofia.conf.xml` wildcard `../sip_profiles/*.xml` already covers external.xml — no freeswitch.xml change needed
+- **Step 7A.3:** Loaded external profile into running container: `reloadxml` + `sofia profile external start` — profile RUNNING on :5080
+- **Step 7A.4:** Rewrote `PhoneNumbersService.upsertFreeSwitchGateway()` per spec: gateway naming `tn_{phone_number_id.replace(/-/g,'').substring(0,12)}`, `fs.mkdirSync` + `fs.writeFileSync`, ESL `reloadxml` + `sofia profile external rescan`; added `removeFreeSwitchGateway()` for archive; wired both into `create()`, `update()`, `archive()`
+- **Step 7A.5:** `npm run build` → 0 errors; `systemctl restart trustnow-platform-api` → active
+
+**7-Item Checklist — All PASSED:**
+| # | Check | Result |
+|---|-------|--------|
+| 7A-1 | `sip_profiles/external.xml` created | ✅ PASS |
+| 7A-2 | External include in sofia.conf.xml wildcard | ✅ PASS |
+| 7A-3 | FreeSWITCH external profile RUNNING (sip:mod_sofia@172.25.10.142:5080) | ✅ PASS |
+| 7A-4 | `upsertFreeSwitchGateway()` with `tn_${id.replace(/-/g,'').substring(0,12)}` naming + `fs.mkdirSync` | ✅ PASS |
+| 7A-5 | Platform API builds 0 errors | ✅ PASS |
+| 7A-6 | Test gateway write → rescan → `sofia status gateway tn_test000000` shows UP | ✅ PASS |
+| 7A-7 | `originate sofia/gateway/tn_test000000/+12025550001` → `NORMAL_TEMPORARY_FAILURE` (NOT `INVALID_PROFILE`) | ✅ PASS |
+
+**Fix applied:** `$${global_codec_prefs}` undefined in vars.xml — replaced with explicit `PCMU,PCMA,G722`; added `sip-ip`/`sip-port` to profile (required for FreeSWITCH to bind the listener).
+
+**Task Addendum Status: ✅ COMPLETE (4A + 5A + 6A + 7A all verified)**
+
+---
 
 ### TASK 8 onwards ← NEXT STEP
 - Agent Configuration Module (Next.js + shadcn/ui — UI-SPEC-001.md §6.4, 10 tabs)

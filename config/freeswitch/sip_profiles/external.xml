@@ -1,0 +1,32 @@
+<profile name="external">
+  <settings>
+    <param name="debug" value="0"/>
+    <param name="sip-trace" value="no"/>
+    <param name="context" value="public"/>
+    <param name="sip-ip" value="172.25.10.142"/>
+    <param name="rtp-ip" value="172.25.10.142"/>
+    <param name="ext-sip-ip" value="172.25.10.142"/>
+    <param name="ext-rtp-ip" value="172.25.10.142"/>
+    <param name="sip-port" value="5080"/>
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="rtp-hold-timeout-sec" value="1800"/>
+    <param name="dtmf-duration" value="2000"/>
+    <param name="codec-prefs" value="PCMU,PCMA,G722"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="nonce-ttl" value="60"/>
+    <param name="auth-calls" value="false"/>
+    <param name="inbound-late-negotiation" value="true"/>
+    <param name="apply-nat-acl" value="nat.auto"/>
+    <param name="rtp-start-port" value="16384"/>
+    <param name="rtp-end-port" value="32768"/>
+    <param name="tls" value="false"/>
+    <param name="pass-callee-id" value="true"/>
+  </settings>
+  <gateways>
+    <!-- Dynamic per-phone-number gateways written by PhoneNumbersService    -->
+    <!-- as individual XML files into sip_profiles/external/                  -->
+    <!-- e.g. sip_profiles/external/tn_{phone_number_id_12chars}.xml          -->
+    <!-- Activated by: sofia profile external rescan                          -->
+    <X-PRE-PROCESS cmd="include" data="external/*.xml"/>
+  </gateways>
+</profile>
