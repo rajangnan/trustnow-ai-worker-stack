@@ -840,3 +840,118 @@ nginx -v && sudo systemctl status nginx
 *FULL-SCOPE-BRD.md — Complete reference derived from BRD-1 v1.1 Unified Baseline*
 *For Platform Engineer use — read at session start, update RUNBOOK.md after each task*
 *TRUSTNOW CONFIDENTIAL — March 2026*
+
+---
+
+## 17. CO-BROWSING ADDENDUM — Net-New Requirements from ElevenLabs Platform Study
+
+**Source:** CO-BROWSING-DATA-001.md v3.0 (April 2026) — live platform observations  
+**Status:** Requirements confirmed by Platform Owner (Raj). Additive only — no existing BRD sections modified.
+
+---
+
+### BRD-CB-001 — BPO-Specific Industry Verticals in Agent Creation Wizard
+
+**Requirement:** The TRUSTNOW Agent Creation Wizard MUST include five BPO-specialist industry verticals that are NOT present in ElevenLabs or any comparable platform. These verticals are a primary commercial differentiator for TRUSTNOW in the BPO/contact centre market.
+
+**Background:** Co-browsing of the ElevenLabs platform (§7 — Business Agent Wizard) confirmed that ElevenLabs offers 17 generic industries. None of these directly address the core operational verticals of BPO clients. TRUSTNOW must go beyond the baseline and offer purpose-built agent creation paths for the industries that BPO clients actually serve.
+
+**The five BPO-specific verticals required:**
+
+| Vertical | Slug | Target BPO Use | Regulatory context |
+|----------|------|---------------|-------------------|
+| **Debt Collections** | `bpo_debt_collections` | Outbound collections, payment arrangements, dispute handling | FDCPA (US), FCA CONC (UK), NCCP (AU) |
+| **Utilities Customer Service** | `bpo_utilities` | Billing, outages, meter reading, service connections/disconnections, tariff switching | Ofgem (UK), AEMC (AU), state PUC (US) |
+| **Insurance Claims Processing** | `bpo_insurance_claims` | FNOL intake, claims status, document collection, claims triage, settlement explanation | FCA ICOBS (UK), state DOI (US), ASIC (AU) |
+| **Telecoms & Broadband** | `bpo_telecoms` | Billing queries, fault logging, upgrades, retention/churn prevention, roaming queries | Ofcom (UK), FCC (US), ACMA (AU) |
+| **Government Services Delivery** | `bpo_government_services` | Benefits eligibility, application status, document guidance, appointment booking, signposting | GDPR/DPA, Government Digital Service standards |
+
+**Requirements for each BPO vertical:**
+1. Must appear as distinct industry cards in Step 2 of the wizard with `BPO` badge
+2. Must have 6+ specialist use cases beyond the 6 universal use cases
+3. Must have dedicated `agent_templates` entries with regulatory-aware system prompt templates
+4. System prompt templates must include: required call opening identification phrasing, consent capture language where mandated, escalation triggers, industry-specific disposition vocabulary
+5. Must be clearly labelled as "BPO Specialist" verticals in the UI to guide BPO clients to the correct path
+
+**Acceptance criteria:**
+- A BPO client creating a debt collection agent via the wizard gets a system prompt that: identifies the caller and company, states the purpose of the call, follows FDCPA/FCA framework phrasing, and does not include language that could be deemed harassing or threatening
+- A BPO client creating an FNOL agent gets a system prompt that: captures incident date/time/description, gathers policy number, confirms next steps, provides a claim reference
+- These agents perform measurably better (on QA scoring) than agents created via the generic "Finance & Banking" or "Government & Public" categories
+
+**Priority:** P0 — This is a launch-critical differentiator. No GA without BPO verticals.
+
+**Reference:** IMPL-001 §6.2D-C (industry/use-case enums), IMPL-001 §6.2E (seed data strategy), UI-SPEC-001 §6.3A (wizard UI)
+
+---
+
+### BRD-CB-002 — Autonomous AI Worker as a First-Class Wizard Option
+
+**Requirement:** The TRUSTNOW Agent Creation Wizard MUST present the Autonomous AI Worker as a fourth distinct agent type card in Step 1, equal in prominence to Conversational AI Agent and Tools-Assisted Agent.
+
+**Background:** ElevenLabs offers 3 creation paths (Blank, Personal Assistant, Business Agent). TRUSTNOW's unique product offering — the Fully Autonomous AI Worker (BRD §6.3.1) — must be surfaced immediately at the point of creation, not buried in configuration tabs. A BPO client choosing to deploy an Autonomous Worker needs a creation path that sets appropriate expectations and initialises the right configuration defaults.
+
+**Requirements:**
+1. Step 1 wizard card: "Autonomous AI Worker" with `TRUSTNOW Exclusive` badge (cyan)
+2. Preview bubble shows multi-step orchestration scenario
+3. Follows Path B (5-step guided wizard) with an additional Workflow configuration step post-creation
+4. `agent_type = 'autonomous'` stored on the agent record
+5. Agent templates for autonomous workers include multi-step workflow scaffold in system prompt
+
+**Priority:** P1 — Required for GA, not beta.
+
+**Reference:** BRD §6.3.1 (Autonomous Worker spec), UI-SPEC-001 §6.3A Step 1
+
+---
+
+### BRD-CB-003 — Dual Agent Creation Paths (Blank vs Guided)
+
+**Requirement:** The platform MUST support two structurally distinct agent creation paths that produce different outcomes and store different data.
+
+**Background:** Co-browsing confirmed (§1) that ElevenLabs' Blank Agent path is a 2-step flow that produces an empty agent (no system prompt, no first message, no industry/use case metadata). The guided path (§7) is a 5-step flow that produces a fully configured agent via AI generation.
+
+**Requirements:**
+1. `creation_path VARCHAR(20)` field on `agents` table: `'blank'` or `'guided'`
+2. `POST /agents` endpoint (blank path) — fast, < 200ms, no LLM call
+3. `POST /agents/wizard` endpoint (guided path) — calls LLM, 2–4s
+4. MIS/analytics MUST report on `creation_path` distribution (what % of agents are created blank vs guided) — this informs product decisions on wizard quality
+5. Agents created via blank path SHOULD show an onboarding nudge in Tab 1 encouraging the user to complete the system prompt if it has been blank for > 24 hours
+
+**Priority:** P0 — Both paths required for launch.
+
+**Reference:** IMPL-001 §6.2D-A, §6.2D-B, UI-SPEC-001 §6.3A
+
+---
+
+### BRD-CB-004 — PII Redaction in Conversation Transcripts
+
+**Requirement:** The TRUSTNOW platform MUST offer an automated PII (Personally Identifiable Information) redaction capability that scrubs sensitive data from conversation transcripts before they are persisted to storage.
+
+**Background:** Co-browsing of ElevenLabs (§4 — Tab 10 Advanced, Privacy section) confirmed that ElevenLabs provides three privacy controls (Zero Retention Mode, Store Call Audio, Retention Period) but has **no transcript PII redaction**. For BPO clients operating under GDPR (EU/UK), FDCPA (US debt collection), FCA CONC (UK consumer credit), and HIPAA (US healthcare), storing raw transcripts containing caller PII is a compliance liability. TRUSTNOW must exceed ElevenLabs by providing automated PII redaction as a first-class agent configuration option.
+
+**PII categories to be redacted (minimum scope for launch):**
+- Payment card numbers (PAN)
+- Social Security Numbers / National Insurance Numbers
+- Dates of birth
+- Email addresses
+- UK and international postcodes / ZIP codes
+- Phone numbers (mobile and landline patterns)
+- Account numbers (contextual detection — number adjacent to "account" keyword)
+
+**Requirements:**
+1. `pii_redaction_enabled BOOLEAN DEFAULT false` on `agent_configs` table
+2. When enabled: PII redaction runs on the transcript **after call ends, before any write to PostgreSQL** — the raw unredacted transcript is never persisted to disk
+3. Redaction replaces PII with labelled tokens: `[CARD_NUMBER]`, `[SSN]`, `[EMAIL]`, etc.
+4. Redaction does NOT apply to audio recordings (`store_call_audio` is separate) — only transcript text
+5. Post-call webhooks receive the redacted transcript (not raw) when PII redaction is enabled
+6. UI shows `🛡 PII Protected` badge on agents with PII redaction enabled — visible in the Agents list card and in Tab 10 Privacy section header
+7. Audit log entry on every agent where PII redaction setting changes (`pii_redaction_enabled` toggle on/off)
+
+**Regulatory alignment:**
+- GDPR Article 5(1)(c) — data minimisation principle
+- GDPR Article 25 — privacy by design
+- FDCPA — prohibits storing debtor PII beyond necessity
+- FCA CONC 4.2 — consumer credit communication records
+
+**Priority:** P0 for any BPO client vertical (debt collections, insurance, healthcare). P1 for all other verticals.
+
+**Reference:** IMPL-001 §6.2H (PII Redaction Service), UI-SPEC-001 §6.4 TAB 10 (Privacy section), agent_configs.pii_redaction_enabled

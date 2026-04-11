@@ -507,20 +507,68 @@ These modules have no layer affiliation — every other module depends on them.
 
 ---
 
-### L5-03: Widget Publisher Service
-- **Responsibility:** Generate and serve the embeddable `<trustnow-agent>` web widget. Stores widget configuration per agent. Generates embed code. Serves the compiled widget JavaScript bundle from Nginx CDN. Handles feedback collection (1-5 star + comment) post-call.
+### L5-03: Widget Publisher Service + Widget CDN Bundle
+
+**Two components — both part of the same build task (Task 8):**
+
+**Component A — Widget Publisher Service (NestJS WidgetModule):**
+- **Responsibility:** Store widget configuration per agent. Generate embed code. Handle feedback collection (1-5 star CSAT + comment). Generate and return shareable page URLs. Handle avatar image uploads.
 - **BRD Reference:** BRD-L5-AGM-WG-001 to WG-009, §8.3.4
-- **Technology:** NestJS WidgetModule (config storage), vanilla JS/WebComponents (widget bundle), Nginx (CDN delivery)
-- **State Classification:** STATELESS (config in PostgreSQL, JS bundle on disk)
-- **Owns:** PostgreSQL `widget_configs` table, Nginx `/widget/` static directory
+- **Technology:** NestJS WidgetModule (config storage), MinIO (avatar image storage)
+- **State Classification:** STATELESS (config in PostgreSQL, avatars in MinIO)
+- **Owns:** PostgreSQL `widget_configs` table, MinIO `trustnow-widget-assets` bucket
 - **Exposes:**
-  - `PUT /agents/:id/widget` — save widget config
-  - `GET /agents/:id/widget/embed` — return embed code snippet
-  - `POST /widget/feedback` — receive post-call feedback (called from widget JS in caller's browser)
-  - Static: `GET /widget/trustnow-agent.js` — the embeddable widget JavaScript
+  - `GET /agents/:id/widget` — return widget config (for UI)
+  - `PUT /agents/:id/widget` — save widget config (all fields, upsert)
+  - `POST /agents/:id/widget/avatar` — upload avatar image → store in MinIO → return CDN URL
+  - `GET /agents/:id/widget/embed` — return embed code snippet (2-line HTML)
+  - `GET /agents/:id/widget/shareable-url` — return public shareable page URL
+  - `POST /widget/feedback` — receive post-call CSAT feedback from caller's browser
 - **Communicates via:** REST
-- **Scales independently:** NO — static file serving scales with Nginx
-- **Isolation test:** Configure widget, verify embed code generated. Load widget JS in a test HTML page, verify `<trustnow-agent>` custom element renders. Submit feedback, verify stored in DB.
+- **Scales independently:** NO — scales with Platform API
+
+**Component B — Widget CDN Bundle (client-side Web Component):**
+- **Responsibility:** Deliver the `<trustnow-agent>` Web Component JavaScript bundle to client websites. This is a **separate build artifact** from the main React platform frontend — it is a vanilla JS Web Component published to a CDN.
+- **Architecture position:** Layer 5 (CX OS) — client-facing delivery. Loaded directly into BPO client websites, NOT the TRUSTNOW platform UI.
+- **Technology:** Vite/Rollup bundle → single-file Web Component (`embed.js`) → CloudFront + S3 CDN
+- **Embed code (confirmed live §3.2):**
+  ```html
+  <trustnow-agent agent-id="[AGENT_ID]"></trustnow-agent>
+  <script src="https://cdn.trustnow.ai/widget/embed.js" async type="text/javascript"></script>
+  ```
+- **CDN URL:** `https://cdn.trustnow.ai/widget/embed.js`
+- **Versioned URL:** `https://cdn.trustnow.ai/widget/embed@v1.x.x.js` (version pinning for enterprise clients)
+- **State Classification:** STATELESS — widget loads config via `GET /agents/:id/widget` at runtime using the `agent-id` attribute
+- **Owns:** S3 `trustnow-widget-cdn` bucket, CloudFront distribution
+- **Build requirements:**
+  - No `eval()` — strict Content Security Policy (CSP) compliant
+  - CORS: `Access-Control-Allow-Origin: *` (must load on any client domain)
+  - Single file bundle — no dynamic imports (for CSP compatibility)
+  - Semantic versioning + CHANGELOG maintained
+  - Bundle size target: < 50KB gzipped
+- **Widget runtime data flow:**
+  ```
+  Client website loads embed.js from cdn.trustnow.ai
+      ↓
+  <trustnow-agent agent-id="X"> renders Web Component in Shadow DOM
+      ↓
+  Widget JS calls GET https://app.trustnow.ai/agents/X/widget (CORS-enabled)
+      ↓
+  Loads widget_configs (colors, text, avatar, toggles)
+      ↓
+  User clicks → widget initiates WebRTC or WebSocket call to Platform API
+      ↓
+  Live call: audio ↔ AI Pipeline via WebRTC/WebSocket
+      ↓
+  Post-call: POST /widget/feedback (CSAT rating)
+  ```
+- **Scales independently:** YES (CloudFront CDN scales to global traffic automatically)
+- **Isolation test:** Load `embed.js` in a test HTML page. Confirm `<trustnow-agent>` renders without errors. Open DevTools — confirm no CSP violations, no eval calls. Test with an agent that has `avatar_type='orb'` and one with `avatar_type='image'`. Test feedback submission.
+
+**EXCEED ELEVENLABS — Widget CDN additions:**
+- Framework-specific embed snippets: JavaScript (raw) | React | Vue | Angular — shown as code tabs in Widget tab UI
+- CSP policy strings displayed in embed section so BPO clients' IT teams can copy-paste the exact headers needed
+- Version pinning UI: dropdown to select widget bundle version (latest / pinned to v1.x)
 
 ---
 

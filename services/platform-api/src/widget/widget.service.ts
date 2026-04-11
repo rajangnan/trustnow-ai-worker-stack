@@ -1,6 +1,25 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { v4 as uuidv4 } from 'uuid';
+import { extname } from 'path';
 import { getPool } from '../database/db.provider';
 import { AuditService } from '../audit/audit.service';
+
+const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
+const WIDGET_BUCKET = 'trustnow-widget-assets';
+
+function getS3Client(): S3Client {
+  return new S3Client({
+    endpoint: process.env.MINIO_ENDPOINT || 'http://127.0.0.1:9000',
+    region: 'us-east-1',
+    credentials: {
+      accessKeyId: process.env.MINIO_ACCESS_KEY || 'trustnow',
+      secretAccessKey: process.env.MINIO_SECRET_KEY || 'trustnow123',
+    },
+    forcePathStyle: true,
+  });
+}
 
 @Injectable()
 export class WidgetService {
@@ -69,6 +88,55 @@ export class WidgetService {
       resource_id: rows[0].widget_id, diff_json: dto,
     });
     return rows[0];
+  }
+
+  async uploadAvatar(tenantId: string, agentId: string, file: Express.Multer.File, actorId: string) {
+    if (!file) throw new BadRequestException('No file uploaded');
+    if (!ALLOWED_MIME.includes(file.mimetype)) {
+      throw new BadRequestException('Unsupported file type. Upload a JPEG, PNG, WebP, or GIF image.');
+    }
+    if (file.size > MAX_AVATAR_SIZE) {
+      throw new BadRequestException('File exceeds 2MB limit.');
+    }
+    const ext = extname(file.originalname).toLowerCase() || '.jpg';
+    const key = `widget-avatars/${tenantId}/${agentId}/${uuidv4()}${ext}`;
+    const s3 = getS3Client();
+    await s3.send(new PutObjectCommand({
+      Bucket: WIDGET_BUCKET,
+      Key: key,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    }));
+    const cdnBase = process.env.CDN_BASE_URL || 'https://cdn.trustnow.ai/widget-assets';
+    const avatarUrl = `${cdnBase}/${key}`;
+    const pool = getPool();
+    await pool.query(
+      `UPDATE widget_configs SET avatar_image_url = $1, avatar_type = 'image' WHERE agent_id = $2`,
+      [avatarUrl, agentId],
+    );
+    await this.audit.log({
+      tenant_id: tenantId, actor_id: actorId,
+      action: 'widget.avatar.upload', resource_type: 'widget_config', resource_id: agentId,
+      diff_json: { avatar_url: avatarUrl },
+    });
+    return { avatar_url: avatarUrl };
+  }
+
+  async getShareableUrl(tenantId: string, agentId: string) {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT a.status, av.is_live
+       FROM agents a
+       LEFT JOIN agent_versions av ON av.agent_id = a.agent_id AND av.is_live = true
+       WHERE a.tenant_id = $1 AND a.agent_id = $2 AND a.status != 'archived'`,
+      [tenantId, agentId],
+    );
+    if (!rows.length) throw new NotFoundException('Agent not found');
+    const appBase = process.env.APP_BASE_URL || 'https://app.trustnow.ai';
+    return {
+      shareable_url: `${appBase}/agent/${agentId}`,
+      is_live: rows.some((r: any) => r.is_live === true),
+    };
   }
 
   async getEmbedCode(tenantId: string, agentId: string) {

@@ -1,0 +1,66 @@
+model_list:
+  # OpenAI — BRD §4.1.1
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  # Anthropic — BRD §4.1.1
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-haiku
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  # Google — BRD §4.1.1
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GOOGLE_API_KEY
+  - model_name: gemini-pro
+    litellm_params:
+      model: gemini/gemini-2.5-pro
+      api_key: os.environ/GOOGLE_API_KEY
+  # Alibaba/Qwen — BRD §4.1.1
+  - model_name: qwen-max
+    litellm_params:
+      model: openai/qwen2.5-72b-instruct
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/QWEN_API_KEY
+  # Mistral — BRD §4.1.1
+  - model_name: mistral-large
+    litellm_params:
+      model: mistral/mistral-large-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  # Meta/Llama via Groq — BRD §4.1.1
+  - model_name: llama-3.1-70b
+    litellm_params:
+      model: groq/llama-3.1-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+  # On-Prem Ollama — BRD §4.2 Partition B
+  - model_name: ollama-llama3
+    litellm_params:
+      model: ollama/llama3.1:8b
+      api_base: http://localhost:11434
+  - model_name: ollama-mistral
+    litellm_params:
+      model: ollama/mistral:7b
+      api_base: http://localhost:11434
+  - model_name: ollama-qwen2
+    litellm_params:
+      model: ollama/qwen2:7b
+      api_base: http://localhost:11434
+litellm_settings:
+  success_callback: ["prometheus"]
+  failure_callback: ["prometheus"]
+  cache: true
+  cache_params:
+    type: redis
+    host: localhost
+    port: 6379
+    password: os.environ/REDIS_PASSWORD

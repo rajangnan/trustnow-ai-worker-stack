@@ -6,12 +6,13 @@ import { AuditService } from '../audit/audit.service';
 export class ToolsService {
   constructor(private audit: AuditService) {}
 
-  async findAll(tenantId: string) {
+  async findAll(tenantId: string, agentId?: string) {
     const pool = getPool();
-    const { rows } = await pool.query(
-      'SELECT * FROM tools WHERE tenant_id = $1 ORDER BY created_at DESC',
-      [tenantId],
-    );
+    let query = `SELECT * FROM tools WHERE tenant_id = $1 AND type != 'mcp'`;
+    const params: any[] = [tenantId];
+    if (agentId) { query += ` AND agent_id = $2`; params.push(agentId); }
+    query += ` ORDER BY created_at DESC`;
+    const { rows } = await pool.query(query, params);
     return rows;
   }
 
@@ -105,17 +106,118 @@ export class ToolsService {
     return { success: true };
   }
 
-  // MCP (Model Context Protocol) server management
-  async getMcpServers(tenantId: string) {
+  // System tools — PATCH semantics (§6.2J)
+  async patchAgentSystemTools(tenantId: string, agentId: string, dto: Record<string, boolean>, actorId: string) {
     const pool = getPool();
-    const { rows } = await pool.query(
-      `SELECT * FROM tools WHERE tenant_id = $1 AND type = 'mcp' ORDER BY created_at DESC`,
-      [tenantId],
+    const { rows: existing } = await pool.query(
+      'SELECT tools_config_json FROM agent_configs WHERE agent_id = $1',
+      [agentId],
     );
+    const current = existing[0]?.tools_config_json || {};
+    const currentSystemTools = (current as any).system_tools || {};
+    const merged = { ...currentSystemTools, ...dto };
+    const updated = { ...(current as any), system_tools: merged };
+    await pool.query(
+      'UPDATE agent_configs SET tools_config_json = $1 WHERE agent_id = $2',
+      [JSON.stringify(updated), agentId],
+    );
+    await this.audit.log({
+      tenant_id: tenantId, actor_id: actorId,
+      action: 'tool.system.patch', resource_type: 'agent_config', resource_id: agentId,
+      diff_json: dto,
+    });
+    const activeCount = Object.values(merged).filter(Boolean).length;
+    return { system_tools: merged, active_count: activeCount };
+  }
+
+  // MCP (Model Context Protocol) server management
+  async getMcpServers(tenantId: string, agentId?: string) {
+    const pool = getPool();
+    let query = `SELECT * FROM tools WHERE tenant_id = $1 AND type = 'mcp'`;
+    const params: any[] = [tenantId];
+    if (agentId) {
+      query += ` AND (agent_id = $2 OR agent_id IS NULL)`;
+      params.push(agentId);
+    }
+    query += ` ORDER BY created_at DESC`;
+    const { rows } = await pool.query(query, params);
     return rows;
   }
 
   async createMcpServer(tenantId: string, dto: any, actorId: string) {
     return this.create(tenantId, { ...dto, type: 'mcp' }, actorId);
+  }
+
+  async deleteMcpServer(tenantId: string, serverId: string, actorId: string) {
+    const pool = getPool();
+    await pool.query(
+      `DELETE FROM tools WHERE tenant_id = $1 AND tool_id = $2 AND type = 'mcp'`,
+      [tenantId, serverId],
+    );
+    await this.audit.log({
+      tenant_id: tenantId, actor_id: actorId,
+      action: 'mcp.server.delete', resource_type: 'tool', resource_id: serverId,
+    });
+    return { deleted: true };
+  }
+
+  async acceptMcpTerms(tenantId: string, actorId: string) {
+    const pool = getPool();
+    // Check if already accepted
+    const { rows } = await pool.query(
+      `SELECT settings_json FROM tenants WHERE tenant_id = $1`,
+      [tenantId],
+    );
+    const settings = rows[0]?.settings_json || {};
+    if (settings.mcp_terms_accepted) {
+      throw new Error('Terms already accepted by this workspace');
+    }
+    const acceptedAt = new Date().toISOString();
+    await pool.query(
+      `UPDATE tenants SET settings_json = settings_json ||
+       $1::jsonb WHERE tenant_id = $2`,
+      [JSON.stringify({ mcp_terms_accepted: true, mcp_terms_accepted_at: acceptedAt, mcp_terms_accepted_by: actorId }), tenantId],
+    );
+    await this.audit.log({
+      tenant_id: tenantId, actor_id: actorId,
+      action: 'mcp.terms.accept', resource_type: 'tenant', resource_id: tenantId,
+    });
+    return { accepted: true, accepted_at: acceptedAt };
+  }
+
+  async testTool(tenantId: string, dto: any) {
+    const axios = (await import('axios')).default;
+    const method = (dto.method || 'POST').toLowerCase();
+    const start = Date.now();
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(dto.headers || {}) };
+      const response = await axios({
+        method,
+        url: dto.url,
+        headers,
+        data: dto.test_payload || {},
+        timeout: (dto.response_timeout_s || 20) * 1000,
+      });
+      return { status: response.status, body: response.data, latency_ms: Date.now() - start };
+    } catch (err: any) {
+      return {
+        status: err.response?.status || 0,
+        body: err.response?.data || err.message,
+        latency_ms: Date.now() - start,
+      };
+    }
+  }
+
+  async getToolHistory(tenantId: string, toolId: string) {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT al.created_at, al.actor_id, al.diff_json, u.email AS actor_email
+       FROM audit_logs al
+       LEFT JOIN users u ON u.user_id::text = al.actor_id
+       WHERE al.resource_type = 'tool' AND al.resource_id = $1 AND al.tenant_id = $2
+       ORDER BY al.created_at DESC LIMIT 50`,
+      [toolId, tenantId],
+    );
+    return rows;
   }
 }

@@ -1,6 +1,6 @@
 # IMPL-001.md — TRUSTNOW Autonomous AI Stack
 ## Complete Implementation Manual — All Tasks, All Layers
-### Document ID: IMPL-001 v3.1 | March 2026
+### Document ID: IMPL-001 v3.3 | March 2026
 ### CONFIDENTIAL — FOR INTERNAL USE ONLY
 
 ---
@@ -12,6 +12,8 @@
 | v1.0 | March 2026 | Initial baseline — Task 1 OS Hardening + Task 2 First Batch infra only |
 | v1.1 | March 2026 | Added Task 2 Second Batch (FasterWhisper, Ollama, Piper, TimescaleDB, Nginx) |
 | v2.0 | March 2026 | Complete rewrite — full BRD scope alignment. Added Tasks 3–16 covering all five architecture layers, full application build, CI/CD, Kubernetes, voice pipeline, Agent Config Module, Human Agent Desktop, MIS, Recording/QM. Updated all component maps, port reference, and verification checklists. Removed incorrect deferrals. Aligned to FULL-SCOPE-BRD.md. |
+| v3.3 | March 2026 | Targeted endpoint additions: AgentsModule §6.2 route table — added GET /agents/:id/preview-history/count. ConversationsModule §6.2 route table — confirmed GET /agents/:id/preview-history with is_preview=true filter, ?branchId= query param, and full endpoint contract for the Publish button soft gate. |
+| v3.2 | March 2026 | Co-browse live call findings incorporated (28 Mar 2026). Task 9 §9.1–§9.9 fully rewritten with complete turn loop implementation: first_message separate path (no LLM), full STT→LLM→TTS pipeline with latency recording per stage, barge-in interrupt chain (DETECTED_SPEECH → Redis pub/sub → TTS stop), 3-tier silence re-prompt watchdog, platform_end_call() via FreeSWITCH ESL (agent cannot self-terminate — confirmed live), transcript JSON schema with asr/llm/tts latency per turn, real-time transcript streaming via Redis pub/sub, LLM latency display format (Xms vs X.X s), text+voice simultaneous mode. how_call_ended values confirmed. |
 | v3.1 | March 2026 | Task 7 fully expanded: FreeSWITCH (Docker/Ubuntu 24.04 compatible), ESL configuration, Sofia SIP profile, MOH, recording dialplan, CID/UUI header, LiveKit binary+systemd, Vault secrets for both services, NestJS TelephonyModule (EslService + HandoffModule), Python handoff_service.py, 12-point verification checklist. DEFERRED-009 noted. |
 | v3.0 | March 2026 | Gap Register integration (TRUSTNOW-GAP-REGISTER v1.1). Fixed port collision GAP-001 (AI Pipeline moved to :8002). Fixed agent-desktop path GAP-002 (/agent-desktop/ canonical). Replaced placeholder UI tab language GAP-008. Strengthened audit_log immutability GAP-014. Pinned ElevenLabs SDK method GAP-017. Clarified Docker vs K8s deployment boundary GAP-012. Added GitHub remote step. Added PgBouncer connection pooler as pre-Task-5 infrastructure step. Added Kafka KRaft migration note. Added Vault Raft note. Added DEFERRED GAP PLACEHOLDERS throughout relevant task sections so no gap is lost when we reach those stages. |
 
@@ -1314,17 +1316,45 @@ mkdir -p /opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api/src/
 Create `/opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api/src/database/schema.sql` with ALL of the following:
 
 **Entities to implement (19 tables):**
-- `tenants` — tenant_id (uuid PK default uuid_generate_v4()), name, plan_tier, default_partition, settings_json, created_at, status
+- `tenants` — tenant_id (uuid PK default uuid_generate_v4()), name, plan_tier, default_partition,
+  settings_json JSONB DEFAULT '{
+    "mcp_terms_accepted": false,
+    "mcp_terms_accepted_at": null,
+    "mcp_terms_accepted_by": null
+  }',  -- §6.9: MCP Terms accepted once per workspace (not per server). Also stores other workspace-level prefs.
+  created_at, status
 - `users` — user_id, tenant_id (FK+RLS), email, name, role_id, status, last_login, mfa_enabled
 - `roles` — role_id, tenant_id (RLS), name (6 standard roles), permissions_json
-- `agents` — agent_id, tenant_id (RLS), name, type (conversational/tools_assisted/autonomous), status, partition, created_by, current_version_id, post_call_webhook_url, environment (production/staging)
+- `agents` — agent_id, tenant_id (RLS), name,
+  type VARCHAR(20) NOT NULL DEFAULT 'conversational',  -- conversational|tools_assisted|autonomous (agent capability level)
+  creation_path VARCHAR(20) NOT NULL DEFAULT 'blank',  -- blank|guided (which wizard path created this agent)
+  industry VARCHAR(60) DEFAULT NULL,                   -- from Step 2 of guided wizard (e.g. 'healthcare_medical', 'bpo_collections')
+  use_case VARCHAR(80) DEFAULT NULL,                   -- from Step 3 of guided wizard (e.g. 'telehealth_support')
+  main_goal TEXT DEFAULT NULL,                         -- from Step 5 of guided wizard — free text, used in LLM prompt generation
+  website_url TEXT DEFAULT NULL,                       -- from Step 5 of guided wizard — async-crawled post-creation to enrich system prompt
+  text_only BOOLEAN DEFAULT false,                     -- from Chat only toggle (present on BOTH blank and guided paths, Step 2/Step 5 respectively)
+  status VARCHAR(20) DEFAULT 'draft',                  -- draft|live|paused|archived
+  partition VARCHAR(10) DEFAULT 'A',                   -- A=cloud|B=onprem
+  created_by UUID REFERENCES users(user_id),
+  current_version_id UUID,                             -- FK to agent_versions, updated on Publish
+  post_call_webhook_url TEXT DEFAULT NULL,
+  environment VARCHAR(20) DEFAULT 'production',        -- production|staging|development
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  analysis_language VARCHAR(10) DEFAULT 'auto'         -- §9.4: 'auto'|language code — used for post-call LLM summary + criteria evaluation
 - `agent_configs` — config_id, agent_id, version,
   -- Core
-  system_prompt, default_personality_enabled BOOLEAN DEFAULT false, timezone_override VARCHAR(50),
-  first_message, first_message_interruptible BOOLEAN DEFAULT true,
+  system_prompt TEXT DEFAULT '',
+  default_personality_enabled BOOLEAN DEFAULT true,   -- CONFIRMED LIVE: ON by default. Applies ElevenLabs base personality layer on top of system prompt.
+  timezone_variable_enabled BOOLEAN DEFAULT false,    -- tracks whether {timezone} was injected via "Set timezone" button
+  timezone_override VARCHAR(50),                       -- explicit timezone override (e.g. 'Asia/Kolkata') — distinct from {timezone} variable
+  first_message TEXT DEFAULT '',
+  first_message_interruptible BOOLEAN DEFAULT true,
+  first_message_localized JSONB DEFAULT '{}',         -- {"hi": "...", "ta": "..."} per-language first message overrides
   -- Voice
   voice_id, expressive_mode_enabled BOOLEAN DEFAULT false,
-  additional_voices JSONB DEFAULT '[]',  -- array of {voice_id, language}
+  expressive_mode_dismissed BOOLEAN DEFAULT false,    -- tracks whether the Expressive Mode promo card was dismissed (UI preference, not a feature toggle)
+  additional_voices JSONB DEFAULT '[]',               -- array of {voice_id, language}
   -- Language
   primary_language, additional_languages[], hinglish_mode_enabled BOOLEAN DEFAULT false,
   language_groups JSONB DEFAULT '[]',  -- e.g. [{name:"Hindi & Tamil", languages:["hi","ta"]}]
@@ -1334,80 +1364,579 @@ Create `/opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api/src/d
   llm_temperature NUMERIC(3,2) DEFAULT 0.5,
   llm_thinking_budget_enabled BOOLEAN DEFAULT false,
   llm_max_tokens INTEGER DEFAULT -1,
+  llm_cascade_timeout_s INTEGER DEFAULT 8,  -- seconds before trying backup LLM (NEW)
   -- STT/TTS
   stt_provider_id, tts_provider_id,
+  -- Multimodal input (NEW)
+  allow_file_attachments BOOLEAN DEFAULT false,  -- images/PDFs in chat (requires multimodal LLM)
   -- Conversation behaviour
-  eagerness VARCHAR(10) DEFAULT 'normal',  -- low|normal|high
+  eagerness VARCHAR(10) DEFAULT 'normal',  -- eager|normal|patient (NOT low|normal|high — confirmed live)
+  spelling_patience VARCHAR(10) DEFAULT 'auto',  -- auto|off (NEW — extends VAD when user spells names/numbers)
   speculative_turn_enabled BOOLEAN DEFAULT false,
-  take_turn_after_silence_ms INTEGER DEFAULT 7000,
+  take_turn_after_silence_s INTEGER DEFAULT 7,  -- renamed from _ms to _s (confirmed: value is 7 seconds)
   end_conversation_after_silence_s INTEGER DEFAULT -1,
   max_conversation_duration_s INTEGER DEFAULT 600,
   max_conversation_duration_message TEXT DEFAULT 'Conversation ended, goodbye!',
+  max_duration_message_localized JSONB DEFAULT '{}',  -- per-language overrides (NEW)
   soft_timeout_s INTEGER DEFAULT -1,
+  soft_timeout_message TEXT DEFAULT 'Let me check that for you...',  -- filler TTS spoken during soft timeout wait (CO-BROWSING §4.4)
+  soft_timeout_message_localized JSONB DEFAULT '{}',  -- per-language overrides: {"hi": "...", "es": "..."}
   filter_background_speech_enabled BOOLEAN DEFAULT false,
-  asr_model VARCHAR(50) DEFAULT 'original',
-  user_input_audio_format VARCHAR(30) DEFAULT 'pcm_16000',
-  -- Guardrails
-  guardrails_focus_enabled BOOLEAN DEFAULT false,
-  guardrails_focus_config JSONB,
-  guardrails_manipulation_enabled BOOLEAN DEFAULT false,
+  asr_model VARCHAR(50) DEFAULT 'original',  -- original|scribe_realtime_v2_1
+  user_input_audio_format VARCHAR(30) DEFAULT 'pcm_16000',  -- pcm_8000|pcm_16000|pcm_22050|pcm_24000|pcm_44100|pcm_48000|ulaw_8000
+  -- Client events (NEW)
+  client_events TEXT[] DEFAULT ARRAY['audio','interruption','user_transcript','agent_response','agent_response_correction'],
+  -- Guardrails (§5.2 — card-based redesign confirmed live)
+  guardrails_focus_enabled BOOLEAN DEFAULT false,              -- Focus card: keeps agent on-topic
+  -- NOTE: guardrails_focus_config JSONB removed — Focus is a simple boolean, no sub-config (confirmed §5.2)
+  guardrails_manipulation_enabled BOOLEAN DEFAULT false,       -- Manipulation card: parent toggle
+  guardrails_prompt_injection BOOLEAN DEFAULT false,           -- sub-toggle inside Manipulation drawer (NEW)
+  guardrails_content_enabled BOOLEAN DEFAULT false,            -- Content card (sub-toggles TBC — drawer not fully explored in §5.2)
+  guardrails_custom_prompt TEXT DEFAULT null,                  -- Custom card: user-written guardrail instructions
+  -- Privacy (CO-BROWSING §4.7 + TRUSTNOW BPO extension)
+  zero_retention_mode BOOLEAN DEFAULT false,  -- no conversation content stored
+  store_call_audio BOOLEAN DEFAULT true,  -- audio recording stored
+  conversations_retention_days INTEGER DEFAULT -1,  -- -1 = unlimited; positive = auto-purge after N days
+  pii_redaction_enabled BOOLEAN DEFAULT false,  -- TRUSTNOW EXCEED ELEVENLABS: auto-redact PII from transcripts before storage (phone numbers, account numbers, DOB, addresses)
   -- Overrides (what callers can override per-conversation)
   allowed_overrides TEXT[] DEFAULT '{}', -- first_message|system_prompt|llm|voice|voice_speed|voice_stability|voice_similarity|text_only
-  -- RAG
-  rag_enabled BOOLEAN DEFAULT false,
-  rag_embedding_model VARCHAR(30) DEFAULT 'multilingual',  -- english|multilingual
+  -- RAG (§8.4 — confirmed live defaults)
+  rag_enabled BOOLEAN DEFAULT true,                -- CONFIRMED LIVE: ON by default (not false — corrected)
+  rag_embedding_model VARCHAR(30) DEFAULT 'english',  -- 'english'|'multilingual' (co-browsing: English optimized is default)
   rag_character_limit INTEGER DEFAULT 50000,
   rag_chunk_limit INTEGER DEFAULT 20,
   rag_vector_distance_limit NUMERIC(4,3) DEFAULT 0.5,
   rag_num_candidates_enabled BOOLEAN DEFAULT false,
-  rag_num_candidates INTEGER DEFAULT 100,
+  rag_num_candidates_value INTEGER DEFAULT 100,       -- renamed from rag_num_candidates for clarity
   rag_query_rewrite_enabled BOOLEAN DEFAULT false,
+  rag_query_rewrite_prompt TEXT DEFAULT null,         -- custom prompt when query rewrite is ON (NEW)
   -- Other
-  tools_config_json, kb_docs_attached[], widget_config_id, auth_policy_id, handoff_policy_id
-- `agent_versions` — version_id, agent_id, config_snapshot_json, published_by, published_at, traffic_split_pct INTEGER DEFAULT 100, is_live BOOLEAN DEFAULT false
-- `agent_templates` — template_id, agent_type (conversational/tools_assisted/autonomous), industry VARCHAR(50), use_case VARCHAR(80), system_prompt_template TEXT, first_message_template TEXT, suggested_voice_id, suggested_llm_model_id, suggested_tools TEXT[], created_at
-  -- 17 industries × up to 13 use cases each. Seed minimum 21 templates for launch (7 industries × 3 use cases).
+  tools_config_json JSONB DEFAULT '{
+    "system_tools": {
+      "end_conversation": false,
+      "detect_language": false,
+      "skip_turn": false,
+      "transfer_to_agent": false,
+      "transfer_to_number": false,
+      "play_keypad_touch_tone": false,
+      "voicemail_detection": false
+    },
+    "attached_tool_ids": []
+  }',  -- §6.3: system tool toggles + list of user-created tool UUIDs attached to this agent
+- `agent_versions` — version_id, agent_id,
+  -- NOTE: agent_versions is a lightweight pointer table — the canonical branch/version data
+  -- is in agent_branches + branch_versions (confirmed §13.7). agent_versions.current_version_id
+  -- on agents table points to the live branch_versions.version_id for routing purposes.
+  config_snapshot_json, published_by, published_at,
+  traffic_split_pct INTEGER DEFAULT 100, is_live BOOLEAN DEFAULT false
+- `agent_branches` — branch_id UUID PK, agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  -- NEW TABLE — §13 Tab 3 (Branches) — one row per agent branch (Main, A, B, etc.)
+  tenant_id UUID NOT NULL (RLS),
+  name VARCHAR(100) NOT NULL,          -- e.g. 'Main', 'Variant A', 'Hindi Script Test'
+  description TEXT,
+  traffic_split DECIMAL(5,2) DEFAULT 0.00,   -- 0.00–100.00 %
+                                              -- all live branches for an agent must sum to 100%
+  status VARCHAR(20) DEFAULT 'draft',         -- 'draft'|'live'|'paused'|'archived'
+  is_protected BOOLEAN DEFAULT false,         -- when true: edits require explicit unlock
+  parent_branch_id UUID REFERENCES agent_branches(branch_id),  -- which branch this was cloned from
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+- `branch_versions` — version_id UUID PK, branch_id UUID NOT NULL REFERENCES agent_branches(branch_id),
+  -- NEW TABLE — §13.4 version history (clock icon) — each Publish creates one row
+  tenant_id UUID NOT NULL (RLS),
+  version_number INTEGER NOT NULL,       -- auto-incremented per branch
+  snapshot JSONB NOT NULL,               -- full agent_configs snapshot at publish time
+  published_by UUID REFERENCES users(user_id),
+  published_at TIMESTAMPTZ DEFAULT now(),
+  notes TEXT                             -- optional publish notes / changelog entry
+- `workflow_versions` — version_id UUID PK, agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  -- NEW TABLE — §12 EXCEED: workflow version history (flagged in Step 11)
+  -- Snapshot taken on every workflow save (not just publish)
+  branch_id UUID NOT NULL,
+  tenant_id UUID NOT NULL (RLS),
+  nodes_json JSONB NOT NULL,             -- workflow_nodes snapshot
+  edges_json JSONB NOT NULL,             -- workflow_edges snapshot
+  saved_by UUID REFERENCES users(user_id),
+  saved_at TIMESTAMPTZ DEFAULT now(),
+  notes TEXT                             -- e.g. "Restored from v3", "Added qualification step"
+  -- Retention: keep last 30 days; older versions auto-purged by retention cron
+- `test_folders` — folder_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §14 workspace test library folder organisation
+  name VARCHAR(100) NOT NULL,
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now()
+- `agent_tests` — test_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §14 workspace-level test definitions (shared across agents)
+  folder_id UUID REFERENCES test_folders(folder_id),
+  name VARCHAR(200) NOT NULL,
+  test_type VARCHAR(20) NOT NULL,        -- 'next_reply'|'tool_invocation'|'simulation'
+  is_template BOOLEAN DEFAULT false,     -- true for the 5 ElevenLabs-equivalent seed templates
+  created_by UUID REFERENCES users(user_id),
+  -- Next Reply fields (§14.5.1)
+  conversation JSONB DEFAULT '[]',       -- [{role: 'user'|'agent', content: '...'}]
+  expected_criteria TEXT,                -- natural language description of expected response
+  success_examples JSONB DEFAULT '[]',   -- example passing responses
+  failure_examples JSONB DEFAULT '[]',   -- example failing responses
+  -- Tool Invocation fields (§14.5.2)
+  tool_type VARCHAR(30),                 -- 'workflow_transition'|'tool_call'
+  target_agent_id UUID REFERENCES agents(agent_id),
+  target_node_id UUID REFERENCES workflow_nodes(node_id),
+  should_invoke BOOLEAN DEFAULT true,    -- pass if tool IS invoked (true) or IS NOT invoked (false)
+  -- Simulation fields (§14.5.3)
+  user_scenario TEXT,                    -- description of simulated user persona
+  success_criteria TEXT,                 -- what defines a passing simulation
+  max_turns INTEGER DEFAULT 5,
+  mock_all_tools BOOLEAN DEFAULT false,
+  -- Shared
+  dynamic_variables JSONB DEFAULT '{}',  -- {key: value} substituted at test run time
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+- `agent_test_attachments` — (agent_id, test_id) junction table,
+  -- NEW TABLE — which tests are attached to which agents (many-to-many)
+  agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  test_id UUID NOT NULL REFERENCES agent_tests(test_id),
+  attached_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (agent_id, test_id)
+- `test_runs` — run_id UUID PK, test_id UUID NOT NULL REFERENCES agent_tests(test_id),
+  -- NEW TABLE — each test execution creates one row
+  tenant_id UUID NOT NULL (RLS),
+  agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  branch_id UUID NOT NULL REFERENCES agent_branches(branch_id),
+  status VARCHAR(20) DEFAULT 'running',  -- 'running'|'passed'|'failed'|'error'
+  result_detail JSONB,                   -- full LLM evaluation response + reasoning
+  duration_ms INTEGER,
+  run_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now()
+- `agent_templates` — template_id, agent_type VARCHAR(20) (conversational/tools_assisted/autonomous), industry VARCHAR(60), use_case VARCHAR(80), system_prompt_template TEXT, first_message_template TEXT, suggested_voice_id, suggested_llm_model_id, suggested_tools TEXT[], is_bpo_specific BOOLEAN DEFAULT false, created_at
+  -- 22 industries (17 ElevenLabs baseline + 5 TRUSTNOW BPO-specific) × up to 13 use cases each.
+  -- Tier 1 launch seed: 48 templates (all 5 BPO industries + Healthcare, Finance, Technology × top 6 use cases).
+  -- Full GA seed: 132+ templates across all 22 industries.
   -- Template placeholders: {{agent_name}}, {{company_name}}, {{industry}}, {{use_case}}, {{main_goal}}, {{website_content}}
+  -- BPO templates include regulatory compliance language, call structure, escalation triggers, industry disposition vocabulary.
+  -- See §6.2D-D for seeding strategy and §6.2D-C for complete industry/use-case enum lists.
 - `voices` — voice_id, tenant_id (null=global), name, description, gender, language_tags[], trait_tags[], provider, sample_audio_url, is_global
 - `llm_providers` — provider_id, name, type (cloud/onprem), base_url, auth_type
 - `llm_models` — model_id, provider_id (FK), model_name, display_name, latency_p50_ms, cost_per_min (numeric), context_window_tokens, supported_languages[], status
 - `stt_providers` — provider_id, name, type (cloud/onprem), base_url, supported_languages[]
 - `tts_providers` — provider_id, name, type (cloud/onprem), base_url, supported_languages[]
-- `knowledge_base_docs` — doc_id, tenant_id (RLS), agent_id, name, type (url/pdf/docx/txt/csv), source_url, storage_path, status (pending/indexing/ready/error), chunk_count, vector_collection_ref, last_indexed_at
-- `tools` — tool_id, tenant_id (RLS), name, type (webhook/client/integration/mcp/system), description, config_json
-- `widget_configs` — widget_id, agent_id, embed_code,
-  feedback_enabled BOOLEAN DEFAULT true,  -- 1-5 star post-call rating
-  interface_settings_json,  -- chat_mode, send_text_on_call, realtime_transcript, language_dropdown, mute_button
-  expanded_behavior VARCHAR(20) DEFAULT 'starts_expanded',  -- starts_expanded|starts_collapsed
-  avatar_type VARCHAR(10) DEFAULT 'orb',  -- orb|link|image
-  avatar_config_json,
-  terms_config_json,
-  styling_config_json,
-  allowed_domains[],
+- `knowledge_base_docs` — doc_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NOTE: NO agent_id FK — KB docs are WORKSPACE-LEVEL assets (confirmed live §8.2)
+  -- Agent-KB relationship is through agent_knowledge_base junction table below
+  name VARCHAR(200) NOT NULL,
+  type VARCHAR(10) NOT NULL,         -- 'url'|'file'|'text'
+  source_url TEXT,                   -- for type='url' — the crawled URL
+  storage_path TEXT,                 -- MinIO path for uploaded files
+  content TEXT,                      -- for type='text' — inline text content
+  status VARCHAR(20) DEFAULT 'pending',  -- 'pending'|'indexing'|'ready'|'failed'
+  visibility VARCHAR(20) DEFAULT 'workspace',  -- 'private'|'workspace'|'public'
+                                     -- 'workspace' = all agents in tenant can use it (confirmed §8.2: shared across agents)
+  chunk_count INTEGER,
+  vector_collection_ref VARCHAR(200),  -- Qdrant collection reference
+  last_indexed_at TIMESTAMPTZ,
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+- `agent_knowledge_base` — junction table (NEW — §8.2 confirmed KB is workspace-level, agents attach to KB docs)
+  agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  kb_doc_id UUID NOT NULL REFERENCES knowledge_base_docs(doc_id),
+  branch_id UUID REFERENCES agent_versions(version_id),  -- which branch this attachment applies to (NULL = all branches)
+  attached_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (agent_id, kb_doc_id, branch_id)
+  -- Index: CREATE INDEX idx_akb_agent ON agent_knowledge_base(agent_id, branch_id)
+  -- Index: CREATE INDEX idx_akb_kb_doc ON agent_knowledge_base(kb_doc_id) -- for "Dependent agents" query
+- `tools` — tool_id, tenant_id (RLS), agent_id, name, type (webhook/client/integration/mcp/system), description,
+  -- HTTP config (webhook only)
+  method VARCHAR(10),                         -- GET|POST|PUT|PATCH|DELETE
+  url TEXT,
+  auth_connection_id UUID,
+  headers JSONB DEFAULT '{}',
+  response_timeout_s INTEGER DEFAULT 20,
+  -- Execution config (all types)
+  disable_interruptions BOOLEAN DEFAULT false,
+  wait_for_response BOOLEAN DEFAULT false,    -- client tools only: pause conversation until client responds
+  pre_tool_speech VARCHAR(10) DEFAULT 'auto', -- auto|force
+  execution_mode VARCHAR(20) DEFAULT 'immediate',
+  tool_call_sound VARCHAR(50) DEFAULT null,
+  -- Parameters & mocking
+  input_schema JSONB,                         -- JSON Schema defining LLM-extractable parameters
+  dynamic_variable_assignments JSONB DEFAULT '{}',  -- which dynamic vars update from tool response
+  response_mocks JSONB DEFAULT '[]'           -- mock conditions for test simulations
+- `widget_configs` — widget_id, agent_id,
+  -- Setup
+  feedback_enabled BOOLEAN DEFAULT true,  -- 1-5 star CSAT post-call rating
+  -- Interface (8 toggles — confirmed live)
+  interface_chat_mode BOOLEAN DEFAULT false,
+  interface_send_text_on_call BOOLEAN DEFAULT false,
+  interface_realtime_transcript BOOLEAN DEFAULT false,
+  interface_language_dropdown BOOLEAN DEFAULT true,
+  interface_mute_button BOOLEAN DEFAULT false,
+  interface_action_indicator BOOLEAN DEFAULT false,       -- NEW
+  interface_show_conversation_id BOOLEAN DEFAULT true,    -- NEW
+  interface_hide_audio_tags BOOLEAN DEFAULT true,         -- NEW
+  expanded_behavior VARCHAR(20) DEFAULT 'starts_expanded',  -- starts_collapsed|starts_expanded|always_expanded
+  -- Markdown links
+  allow_all_domains BOOLEAN DEFAULT false,
+  allowed_domains TEXT[] DEFAULT '{}',
   include_www_variants BOOLEAN DEFAULT true,
-  allow_http_links BOOLEAN DEFAULT false
-- `auth_policies` — policy_id, agent_id, tenant_id (RLS), methods_enabled[], allowed_numbers[], ip_allowlist[], jwt_config_json,
-  conversation_initiation_webhook_url TEXT,  -- for Twilio/SIP trunk client data fetch
-  post_call_webhook_url TEXT,  -- fires after call_ended event
-  allowed_overrides TEXT[] DEFAULT '{}'  -- per-conversation config overrides permitted
+  allow_http_links BOOLEAN DEFAULT true,
+  -- Avatar
+  avatar_type VARCHAR(10) DEFAULT 'orb',  -- orb|link|image
+  avatar_orb_color_1 VARCHAR(7) DEFAULT '#2792dc',   -- first orb gradient color
+  avatar_orb_color_2 VARCHAR(7) DEFAULT '#9ce6e6',   -- second orb gradient color
+  avatar_image_url TEXT DEFAULT null,                 -- for link or uploaded image type
+  -- Style section (NEW — all design tokens)
+  collapsible BOOLEAN DEFAULT false,
+  placement VARCHAR(20) DEFAULT 'bottom_right',       -- bottom_right|bottom_left|top_right|top_left
+  style_config JSONB DEFAULT '{
+    "base": "#000000",
+    "base_hover": "#ffffff",
+    "base_active": "#ffffff",
+    "base_border": "#ffffff",
+    "base_subtle": "#ffffff",
+    "base_primary": "#000000",
+    "accent_border": "#ffffff",
+    "accent_subtle": "#ffffff",
+    "accent_primary": "#ffffff",
+    "overlay_padding": "32px",
+    "button_radius": "18px",
+    "input_radius": "18px",
+    "bubble_radius": "15px",
+    "sheet_radius": "24px",
+    "compact_sheet_radius": "30px"
+  }',
+  code_block_theme VARCHAR(10) DEFAULT 'auto',        -- auto|light|dark
+  -- Text contents / i18n (NEW — 24 tokens)
+  text_contents JSONB DEFAULT '{
+    "main_label": "Need help?",
+    "start_call": "Start a call",
+    "start_chat": "Start a chat",
+    "new_call": "New call",
+    "end_call": "End",
+    "mute_microphone": "Mute microphone",
+    "change_language": "Change language",
+    "collapse": "Collapse",
+    "expand": "Expand",
+    "copied": "Copied!",
+    "accept_terms": "Accept",
+    "dismiss_terms": "Cancel",
+    "connecting_status": "Connecting",
+    "chatting_status": "Chatting with AI Agent",
+    "input_label": "Text message input",
+    "input_placeholder": "Send a message",
+    "input_placeholder_text_only": "Send a message",
+    "input_placeholder_new_conversation": "Start a new conversation",
+    "user_ended_conversation": "You ended the conversation",
+    "agent_ended_conversation": "The agent ended the conversation",
+    "conversation_id": "Conversation ID",
+    "agent_working": "Working...",
+    "agent_done": "Completed",
+    "agent_error": "Error occurred"
+  }',
+  -- Shareable page (NEW)
+  shareable_description TEXT DEFAULT 'Chat with AI',
+  require_terms_on_shareable BOOLEAN DEFAULT false
+- `mcp_servers` — mcp_server_id UUID PK, tenant_id UUID NOT NULL (RLS),   -- NEW TABLE
+  agent_id UUID REFERENCES agents(agent_id),  -- null = workspace-level server
+  name VARCHAR(100) NOT NULL,
+  description TEXT,
+  server_type VARCHAR(20) NOT NULL,           -- 'sse' | 'streamable_http'
+  server_url TEXT NOT NULL,
+  auth_connection_id UUID,                    -- reference to auth config
+  headers JSONB DEFAULT '{}',
+  terms_accepted BOOLEAN DEFAULT false,
+  terms_accepted_at TIMESTAMPTZ,
+  terms_accepted_by UUID,                     -- user_id who accepted
+  created_at TIMESTAMPTZ DEFAULT now()
+- `auth_policies` — policy_id, agent_id, tenant_id (RLS),
+  authentication_enabled BOOLEAN DEFAULT false,   -- §5.1: "Enable authentication" toggle on Security tab
+  allowed_hosts TEXT[] DEFAULT '{}',              -- §5.3: Allowlist — hosts permitted to connect to this agent's WebSocket
+                                                  --   Empty array = any host can connect (public agents)
+                                                  --   Populated = only listed domains accepted
+  methods_enabled[], allowed_numbers[], ip_allowlist[], jwt_config_json,
+  conversation_initiation_webhook_url TEXT,  -- §5.5: fetches caller context from client CRM at call start
+  post_call_webhook_url TEXT,               -- §5.5: fires after call ends (CRM write-back, n8n automation)
+  post_call_webhook_secret TEXT,            -- HMAC secret for signing post-call webhook payloads
+  allowed_overrides TEXT[] DEFAULT '{}',    -- §5.4: which per-conversation overrides the client embed may pass
+                                            --   values: 'first_message'|'system_prompt'|'llm'|'voice'|'voice_speed'|'voice_stability'|'voice_similarity'|'text_only'
 - `handoff_policies` — policy_id, agent_id, tenant_id (RLS), handoff_type, transfer_target, escalation_triggers[], pre_handoff_tts_message
+- `phone_numbers` — phone_number_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §10 Phone Numbers sidebar (Deploy → Phone Numbers)
+  label VARCHAR(100) NOT NULL,          -- descriptive name e.g. "UK Support Line"
+  phone_number VARCHAR(20) NOT NULL,    -- E.164 format e.g. +15551234567
+  agent_id UUID REFERENCES agents(agent_id),  -- assigned agent (NULL = unassigned)
+  -- Inbound SIP settings (Step 3 of 8-step wizard)
+  sip_transport VARCHAR(5) DEFAULT 'tls',            -- 'tcp'|'tls'
+  media_encryption VARCHAR(10) DEFAULT 'required',   -- 'disabled'|'allowed'|'required'
+  -- Outbound SIP settings (Step 4 of 8-step wizard)
+  outbound_address VARCHAR(255),         -- provider SIP hostname e.g. sip.telnyx.com (NO sip: prefix)
+  outbound_transport VARCHAR(5) DEFAULT 'tls',
+  outbound_encryption VARCHAR(10) DEFAULT 'required',
+  -- Authentication (Step 6 — digest auth OR ACL)
+  sip_username VARCHAR(100),             -- digest auth username (NULL = use ACL)
+  sip_password_enc TEXT,                 -- AES-256-encrypted password (stored in Vault reference)
+  -- Custom SIP headers (Step 5 — optional)
+  custom_sip_headers JSONB DEFAULT '[]', -- [{name: "X-Custom", value: "..."}]
+  -- Status
+  status VARCHAR(20) DEFAULT 'active',   -- 'active'|'paused'|'archived'
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  -- Constraint: unique phone number per tenant
+  UNIQUE (tenant_id, phone_number)
+- `whatsapp_accounts` — wa_account_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §16 Deploy → WhatsApp
+  meta_waba_id VARCHAR(100) NOT NULL,       -- WhatsApp Business Account ID from Meta API
+  phone_number_id VARCHAR(100) NOT NULL,    -- Meta phone number ID (distinct from E.164 number)
+  phone_number VARCHAR(20),                 -- E.164 display format e.g. +15551234567
+  display_name VARCHAR(100),               -- WhatsApp Business profile display name
+  agent_id UUID REFERENCES agents(agent_id),  -- assigned agent (NULL = inbound ignored, calls rejected)
+  access_token_enc TEXT,                   -- encrypted Meta Graph API access token (Vault reference)
+  respond_with_audio BOOLEAN DEFAULT true, -- true = TTS audio responses; false = text-only
+  status VARCHAR(20) DEFAULT 'active',     -- 'active'|'paused'|'disconnected'
+  -- System dynamic variables (§16.7 — auto-set per conversation)
+  -- system__caller_id: WhatsApp user ID of the person messaging/calling
+  -- system__called_number: WhatsApp phone number ID of the business account
+  -- (these are runtime values, not stored fields)
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
 - `conversations` — conversation_id (CID uuid PK), agent_id, tenant_id (RLS), channel, status, started_at TIMESTAMPTZ NOT NULL, ended_at, duration_s, recording_url, transcript_json, llm_cost, tts_cost, stt_cost, total_cost, language_detected, handoff_occurred, rating, feedback_text,
-  -- ElevenLabs-parity fields (from live platform observation)
-  call_cost_credits INTEGER,  -- ElevenLabs credits consumed
-  llm_credits INTEGER,
-  environment VARCHAR(20) DEFAULT 'production',  -- production|staging
-  is_preview BOOLEAN DEFAULT false,  -- true for preview/test calls (discounted credit rate, not billed at production rate)
-  how_call_ended VARCHAR(50),  -- client_navigated_away|agent_ended|silence_timeout|max_duration|error
-  user_id VARCHAR(255),  -- caller user ID if auth passed
-  branch_id UUID REFERENCES agent_versions(version_id),  -- which A/B branch handled this call
-  tts_latency_ms_avg INTEGER,  -- avg TTS latency across turns
-  asr_latency_ms_avg INTEGER,  -- avg ASR latency across turns
+  -- ElevenLabs-parity fields (from live platform observation §9.3)
+  call_cost_credits INTEGER,           -- total platform credits consumed
+  llm_credits INTEGER,                 -- LLM-specific credits
+  llm_cost_usd DECIMAL(10,6),         -- actual USD cost (confirmed §9.3.1 — $0.00316 per call)
+  llm_rate_per_min DECIMAL(10,6),     -- per-minute rate applied (NEW — confirmed §9.3.1)
+  environment VARCHAR(20) DEFAULT 'production',   -- production|development|staging
+  is_preview BOOLEAN DEFAULT false,
+  how_call_ended VARCHAR(50),          -- 'client'|'agent'|'silence_timeout'|'max_duration'|'error'
+                                       -- CONFIRMED §9.3.1: 'client' = "Client ended call" (NOT 'client_navigated_away')
+  user_id VARCHAR(255),
+  branch_id UUID REFERENCES agent_versions(version_id),
+  tts_latency_ms_avg INTEGER,
+  asr_latency_ms_avg INTEGER,
   turn_count INTEGER,
-  call_successful BOOLEAN,  -- evaluation criteria result
-  evaluation_results JSONB,  -- per-criteria results
-  data_collection_results JSONB  -- extracted data points from transcript
+  call_successful BOOLEAN,             -- aggregate of all criteria: true only if all pass
+  evaluation_results JSONB DEFAULT '{}',    -- {criteria_id: true/false, ...} per criterion
+  data_collection_results JSONB DEFAULT '{}',  -- renamed from extracted_data for consistency
+  extracted_data JSONB DEFAULT '{}',   -- legacy alias — same as data_collection_results
+  client_data JSONB DEFAULT '{}',      -- caller-side data from variables/flow (§9.3.3)
+  ai_summary TEXT DEFAULT NULL,        -- LLM-generated post-call summary (NEW — §9.3.1)
+  applied_overrides JSONB DEFAULT '{}' -- which per-conversation overrides the client applied (§5.4)
+- `evaluation_criteria` — criteria_id UUID PK, agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  -- NEW TABLE — confirmed §9.4: separate table, not stored in agent_configs JSONB
+  tenant_id UUID NOT NULL (RLS),
+  name VARCHAR(200) NOT NULL,          -- e.g. "Did the agent collect caller's name?"
+  description TEXT,                    -- human-readable description
+  llm_prompt TEXT NOT NULL,            -- prompt sent to LLM post-call: "Given this transcript, did the agent [criterion]? Answer YES or NO."
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+- `data_collection_specs` — spec_id UUID PK, agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  -- NEW TABLE — confirmed §9.4: separate table for structured data extraction specs
+  tenant_id UUID NOT NULL (RLS),
+  field_name VARCHAR(100) NOT NULL,    -- e.g. "customer_intent", "product_mentioned"
+  field_type VARCHAR(20) DEFAULT 'string',  -- 'string'|'boolean'|'number'
+  extraction_prompt TEXT NOT NULL,     -- prompt: "Extract the customer's stated reason for calling from this transcript"
+  is_required BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT now()
+- `conversation_turns` — turn_id UUID PK, conversation_id UUID NOT NULL REFERENCES conversations(conversation_id),
+  -- NEW TABLE — enables per-turn analytics queries and waveform sync
+  -- NOTE: full transcript also stored in conversations.transcript_json for backward compat
+  tenant_id UUID NOT NULL (RLS),
+  turn_index INTEGER NOT NULL,         -- sequential turn number within conversation
+  speaker VARCHAR(10) NOT NULL,        -- 'agent'|'user'
+  text TEXT,
+  timestamp_ms INTEGER,                -- milliseconds from call start
+  tts_latency_ms INTEGER,              -- agent turns only: time from LLM response → TTS audio start
+  llm_latency_ms INTEGER,              -- agent turns only (except first_message)
+  asr_latency_ms INTEGER               -- user turns only
 - `audit_logs` — log_id, tenant_id (RLS), user_id, action, resource_type, resource_id, before_json, after_json, ip_address, timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
 - `recordings` — recording_id, conversation_id (CID FK), tenant_id (RLS), storage_path, duration_s, format, encryption_key_ref, retention_until
+- `workspace_settings` — tenant_id UUID PRIMARY KEY REFERENCES tenants(tenant_id),
+  -- NEW TABLE — §17 Settings page: workspace-level defaults (one row per tenant)
+  -- Webhook fallback: agent-level webhook (auth_policies) takes priority; workspace default fires if none set
+  conversation_initiation_webhook_url TEXT,       -- workspace default initiation webhook
+  conversation_initiation_webhook_auth JSONB DEFAULT '{}',  -- auth config for above
+  post_call_webhook_url TEXT,                     -- workspace default post-call webhook
+  post_call_webhook_secret TEXT,                  -- HMAC signing secret for post-call payloads
+  post_call_webhook_auth JSONB DEFAULT '{}',
+  updated_at TIMESTAMPTZ DEFAULT now()
+- `workspace_secrets` — secret_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §17.4: write-once encrypted secret values for tool configs
+  -- Referenced in tool webhooks as {{secret.SECRET_NAME}} — resolved at runtime, never exposed
+  name VARCHAR(100) NOT NULL,      -- reference key e.g. 'CRM_TOKEN', 'OPENAI_API_KEY'
+  value_enc TEXT NOT NULL,         -- AES-256 encrypted (Vault reference preferred)
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  -- NOTE: No updated_at — secrets are write-once. Delete and recreate to change value.
+  -- The value is NEVER returned to the frontend after creation ("once added cannot be retrieved")
+  UNIQUE (tenant_id, name)
+- `workspace_auth_connections` — auth_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §17.5: reusable auth connections for tool webhook authentication
+  -- Referenced in tool configs via auth_connection_id FK — one configuration, many tools
+  name VARCHAR(100) NOT NULL,      -- e.g. 'Salesforce OAuth', 'HubSpot API Key'
+  auth_type VARCHAR(20) NOT NULL,  -- 'oauth2'|'api_key'|'bearer'|'basic'
+  config_enc JSONB NOT NULL,       -- encrypted auth config (token, client_id/secret, username/password)
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+- `api_keys` — key_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §18 ElevenAPI → Configure → API Keys
+  -- Used by BPO clients/developers to call the TRUSTNOW Platform API programmatically
+  name VARCHAR(100) NOT NULL,           -- e.g. "CRM Connector" or auto-generated "Venerated Persian Leopard"
+  key_hash VARCHAR(64) NOT NULL UNIQUE, -- SHA-256 of actual key — key shown once at creation, never stored
+  key_prefix VARCHAR(12) NOT NULL,      -- first 8 chars for display: e.g. 'sk-tn_ab'
+  restrict_key BOOLEAN DEFAULT true,    -- ON = granular endpoint permissions; OFF = full access
+  monthly_credit_limit INTEGER,         -- NULL = unlimited; positive integer = monthly credit cap
+  permissions JSONB DEFAULT '{}',       -- {endpoint: 'read'|'write'|'access'|null}
+                                        -- TRUSTNOW scopes: agents|tts|stt|conversations|workspace|analytics|
+                                        --   phone_numbers|batch_calls|whatsapp|kb|tools|tests|voices
+  last_used_at TIMESTAMPTZ,
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  is_active BOOLEAN DEFAULT true        -- false = revoked
+- `webhook_endpoints` — endpoint_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §19 ElevenAPI → Configure → Webhooks (platform-level event callbacks)
+  -- Distinct from conversation webhooks (auth_policies/workspace_settings): this fires on platform events
+  url VARCHAR(500) NOT NULL,            -- HTTPS endpoint where TRUSTNOW POSTs event payloads
+  description TEXT,
+  secret_enc TEXT NOT NULL,             -- HMAC shared secret (encrypted) — used to sign payloads
+                                        -- Header name: X-TRUSTNOW-Signature (TRUSTNOW equivalent of ElevenLabs-Signature)
+  events TEXT[] NOT NULL,               -- subscribed events: ['voice.removal', 'transcription.completed', ...]
+  is_active BOOLEAN DEFAULT true,
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+- `webhook_delivery_log` — delivery_id UUID PK, endpoint_id UUID NOT NULL REFERENCES webhook_endpoints(endpoint_id),
+  -- NEW TABLE — delivery audit log for all webhook attempts (success + failure + retry)
+  -- Also used by Settings page webhook payload inspector (§17 EXCEED ElevenLabs item 4)
+  tenant_id UUID NOT NULL (RLS),
+  event_type VARCHAR(50) NOT NULL,      -- e.g. 'voice.removal', 'transcription.completed', 'post_call'
+  payload JSONB NOT NULL,               -- full payload POSTed to endpoint
+  http_status INTEGER,                  -- HTTP response code (null if no response)
+  response_body TEXT,                   -- trimmed response (first 500 chars)
+  duration_ms INTEGER,
+  success BOOLEAN,
+  attempt_number INTEGER DEFAULT 1,     -- 1 = first attempt, 2/3 = retries
+  attempted_at TIMESTAMPTZ DEFAULT now()
+- `environment_variables` — var_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §20 ElevenAPI → Configure → Environment Variables
+  -- Variables defined here are referenced as {{env.VAR_NAME}} in agent configs, tool URLs, system prompts
+  name VARCHAR(100) NOT NULL,          -- snake_case identifier e.g. 'my_api_url', 'CRM_TOKEN'
+  var_type VARCHAR(20) DEFAULT 'string',  -- 'string'|'number'|'boolean'
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(tenant_id, name)              -- name must be unique per workspace
+- `environment_variable_values` — value_id UUID PK, var_id UUID NOT NULL REFERENCES environment_variables(var_id) ON DELETE CASCADE,
+  -- NEW TABLE — one row per environment per variable
+  -- Production is canonical default: if no value for current environment → falls back to production value
+  environment VARCHAR(30) NOT NULL,    -- 'production'|'staging'|'development' (or custom env names)
+  value TEXT NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(var_id, environment)
+- `tts_generations` — generation_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §21 ElevenCreative → Text to Speech (standalone, async TTS — NOT the realtime conversation pipeline)
+  -- Used for: IVR prompts, on-hold messages, bulk voice-overs, training data generation
+  input_text TEXT NOT NULL,              -- source text (max 5,000 chars)
+  voice_id UUID REFERENCES voices(voice_id),
+  model_id VARCHAR(50) NOT NULL,         -- 'eleven_multilingual_v2'|'eleven_v3'|'piper' etc.
+  stability NUMERIC(3,2),                -- 0.0–1.0 slider value
+  similarity_boost NUMERIC(3,2),         -- 0.0–1.0 slider value
+  style_exaggeration NUMERIC(3,2),       -- 0.0–1.0 slider value
+  speed NUMERIC(3,2),                    -- 0.5–2.0x
+  use_speaker_boost BOOLEAN DEFAULT true,
+  language_override VARCHAR(10),         -- null = auto-detect; set for forced language
+  output_format VARCHAR(30) DEFAULT 'mp3_128000',
+  storage_path TEXT,                     -- MinIO path for the generated audio file
+  duration_s NUMERIC(8,2),              -- generated audio duration
+  credits_used INTEGER,
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now()
+- `stt_transcripts` — transcript_id UUID PK, tenant_id UUID NOT NULL (RLS),
+  -- NEW TABLE — §22 ElevenCreative → Speech to Text (standalone async STT — NOT realtime conversation pipeline)
+  -- Used for: meeting transcription, uploaded call recordings, bulk media processing
+  title VARCHAR(200),                    -- user-set or auto-generated from filename
+  source_type VARCHAR(10) NOT NULL,      -- 'upload'|'youtube'|'url'
+  source_url TEXT,                       -- for youtube/url source types; null for file upload
+  storage_path TEXT,                     -- MinIO path for uploaded audio/video (upload type only)
+  file_size_mb DECIMAL(8,2),
+  duration_seconds INTEGER,
+  language_detected VARCHAR(10),         -- auto-detected ISO language code
+  language_override VARCHAR(10),         -- null = Detect (auto); set for forced language
+  tag_audio_events BOOLEAN DEFAULT true, -- detect and label [applause][music][laughter] etc.
+  include_subtitles BOOLEAN DEFAULT false,  -- generate SRT alongside text
+  no_verbatim BOOLEAN DEFAULT false,     -- clean up filler words when true
+  keyterms TEXT[] DEFAULT '{}',          -- domain vocabulary hints for accuracy
+  status VARCHAR(20) DEFAULT 'pending',  -- 'pending'|'processing'|'completed'|'failed'
+  transcript_json JSONB,                 -- full transcript with word-level timestamps
+  srt_content TEXT,                      -- SRT subtitle format (populated when include_subtitles=true)
+  plain_text TEXT,                       -- clean text-only transcript (derived, for search indexing)
+  credits_used INTEGER,
+  error_message TEXT,                    -- populated on status='failed'
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+  -- NEW TABLE — §11 Deploy → Outbound (Batch Calling)
+  name VARCHAR(100) NOT NULL DEFAULT 'Untitled Batch',
+  agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  phone_number_id UUID NOT NULL REFERENCES phone_numbers(phone_number_id),
+  status VARCHAR(20) DEFAULT 'pending',   -- 'pending'|'running'|'completed'|'cancelled'|'failed'
+  ringing_timeout_s INTEGER DEFAULT 60,   -- seconds to ring before marking unanswered
+  concurrency_limit INTEGER,              -- NULL = auto (see formula in §6.2N)
+  total_recipients INTEGER DEFAULT 0,
+  calls_completed INTEGER DEFAULT 0,
+  calls_failed INTEGER DEFAULT 0,
+  calls_pending INTEGER DEFAULT 0,
+  scheduled_at TIMESTAMPTZ,              -- NULL = run immediately on submit
+  timezone VARCHAR(60),                  -- e.g. 'Asia/Calcutta' — from browser auto-detect
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  compliance_acknowledged BOOLEAN DEFAULT false,  -- TRUSTNOW: must be true before submit
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now()
+- `batch_call_recipients` — recipient_id UUID PK, batch_call_id UUID NOT NULL REFERENCES batch_calls(batch_call_id),
+  -- NEW TABLE — one row per recipient in a batch call
+  tenant_id UUID NOT NULL (RLS),
+  phone_number VARCHAR(20) NOT NULL,       -- E.164 — from phone_number column in CSV
+  dynamic_variables JSONB DEFAULT '{}',   -- {name: 'Nav', account_balance: '£245.00', ...}
+  overrides JSONB DEFAULT '{}',           -- {language: 'en', first_message: '...', voice_id: '...', system_prompt: '...'}
+                                          -- only populated when override columns present in CSV
+                                          -- override columns only work if agent's Security Overrides are enabled
+  status VARCHAR(20) DEFAULT 'pending',  -- 'pending'|'in_progress'|'completed'|'failed'|'cancelled'
+  conversation_id UUID REFERENCES conversations(conversation_id),  -- set when call completes
+  attempted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+- `workflow_nodes` — node_id UUID PK, agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  -- NEW TABLE — §12 Tab 2 (Workflow) — individual nodes on the workflow canvas
+  -- NOTE: Replaces workflow_definition_json JSONB on agent_configs (confirmed §12.9 — dedicated tables required)
+  branch_id UUID NOT NULL,            -- which agent branch this workflow belongs to
+  node_type VARCHAR(30) NOT NULL,     -- 'start'|'subagent'|'say'|'agent_transfer'|'phone_transfer'|'tool'|'end'
+  label VARCHAR(100),                 -- display label on canvas node
+  tenant_id UUID NOT NULL (RLS),
+  -- Subagent node fields (§12.7)
+  conversation_goal TEXT,             -- the sub-goal for this node
+  override_prompt BOOLEAN DEFAULT false,  -- when ON: ignore global system prompt, use goal only
+  voice_id UUID REFERENCES voices(voice_id),  -- null = use agent default
+  llm_model VARCHAR(50),              -- null = use agent default
+  eagerness VARCHAR(20),              -- null = use agent default; 'eager'|'normal'|'patient'
+  spelling_patience VARCHAR(10),      -- null = use agent default; 'auto'|'off'
+  speculative_turn_enabled BOOLEAN,   -- null = use agent default
+  -- Canvas position
+  position_x FLOAT NOT NULL DEFAULT 0,
+  position_y FLOAT NOT NULL DEFAULT 0,
+  -- Node-type-specific config (agent_transfer delay/message, tool selection, etc.)
+  config JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT now()
+- `workflow_edges` — edge_id UUID PK, agent_id UUID NOT NULL REFERENCES agents(agent_id),
+  -- NEW TABLE — §12.8 directed edges between workflow nodes
+  branch_id UUID NOT NULL,
+  tenant_id UUID NOT NULL (RLS),
+  source_node_id UUID NOT NULL REFERENCES workflow_nodes(node_id),
+  target_node_id UUID NOT NULL REFERENCES workflow_nodes(node_id),
+  condition_label VARCHAR(200),       -- e.g. 'User info collected', 'Unconditional'
+  condition_type VARCHAR(20) DEFAULT 'llm_evaluated',
+                                      -- 'unconditional'|'llm_evaluated'|'tool_output'
+  priority INTEGER DEFAULT 0,         -- evaluation order — lower = first evaluated
+  created_at TIMESTAMPTZ DEFAULT now()
 
 **Required at end of schema.sql:**
 ```sql
@@ -2907,13 +3436,13 @@ npm install @nestjs/graphql @apollo/server graphql
 | AuthModule | BRD-L5-RB-003 | JWT validation, Keycloak token verify, tenant context injection |
 | TenantsModule | BRD-L5-MT-001/002 | POST /tenants, GET /tenants/:id, tenant onboarding |
 | UsersModule | BRD-L5-RB-001 | CRUD users per tenant, role assignment |
-| AgentsModule | BRD-L5-AGM-001 to 011 | POST /agents, GET /agents, GET /agents/:id, PUT /agents/:id/config, POST /agents/:id/publish, GET /agents/:id/branches, POST /agents/:id/branches, PUT /agents/:id/branches/:branchId/traffic |
+| AgentsModule | BRD-L5-AGM-001 to 011 | POST /agents, GET /agents, GET /agents/:id, PUT /agents/:id/config, POST /agents/:id/publish, GET /agents/:id/branches, POST /agents/:id/branches, PUT /agents/:id/branches/:branchId/traffic, **GET /agents/:id/preview-history/count** |
 | KnowledgeBaseModule | BRD-L5-AGM-012 to 015 | POST /kb/documents, GET /kb/documents, POST /agents/:id/kb/attach, PUT /agents/:id/kb/rag-config |
-| ToolsModule | BRD-L5-AGM-016 to 020 | POST /tools, GET /tools, PUT /tools/:id, DELETE /tools/:id, PUT /agents/:id/tools/system, GET /tools/mcp, POST /tools/mcp |
-| WidgetModule | BRD-L5-AGM-WG-001 to 009 | PUT /agents/:id/widget, GET /agents/:id/widget/embed |
+| ToolsModule | BRD-L5-AGM-016 to 020 | POST /tools, GET /tools, PUT /tools/:id, DELETE /tools/:id, PUT /agents/:id/tools/system, GET /tools/mcp, POST /tools/mcp, GET /mcp-servers, POST /mcp-servers, DELETE /mcp-servers/:id |
+| WidgetModule | BRD-L5-AGM-WG-001 to 009 | PUT /agents/:id/widget, GET /agents/:id/widget/embed, POST /agents/:id/translate-first-message, GET /agents/:id/widget/shareable-url |
 | VoicesModule | BRD-L1-010 to 013 | GET /voices, POST /voices/:id/preview, POST /voices/design, POST /voices/clone, GET /voices/languages/:code/top-picks |
 | LLMProvidersModule | BRD-L1-005 | GET /llm-providers/models (with latency + cost/min), GET /llm-providers |
-| ConversationsModule | BRD-L5-MIS-002 | GET /conversations, GET /conversations/:id, GET /conversations/:id/transcript, GET /conversations/:id/recording, GET /agents/:id/preview-history (list preview conversations with auto-names) |
+| ConversationsModule | BRD-L5-MIS-002 | GET /conversations, GET /conversations/:id, GET /conversations/:id/transcript, GET /conversations/:id/recording, **GET /agents/:id/preview-history** (list preview conversations with auto-generated names, filtered `is_preview=true AND agent_id=:id`, supports `?branchId=` query param, returns same shape as GET /conversations list), **GET /agents/:id/preview-history/count** (alias — returns `{ count: N }` for Publish button soft gate; queries `SELECT COUNT(*) FROM conversations WHERE agent_id=:id AND is_preview=true AND branch_id=:branchId`) |
 | AnalyticsModule | BRD-L5-MIS-001 to 005 | GET /analytics/summary, GET /analytics/conversations, GET /analytics/agents/:id |
 | AuditModule | BRD-L5-RB-004 | Internal — immutable insert to audit_logs on all changes |
 | WebhooksModule | co-browsing | POST /agents/:id/webhooks/post-call, DELETE /agents/:id/webhooks/post-call |
@@ -2958,22 +3487,42 @@ export class UpdateAgentConfigDto {
   stt_provider_id?: string;
   tts_provider_id?: string;
 
-  // Conversational behaviour — ALL NEW from co-browsing
-  eagerness?: 'low' | 'normal' | 'high';
+  // Conversational behaviour — updated from co-browsing v1.5
+  eagerness?: 'eager' | 'normal' | 'patient';    // CORRECTED: eager|normal|patient (NOT low|normal|high)
+  spelling_patience?: 'auto' | 'off';             // NEW — extends VAD when user spells
   speculative_turn_enabled?: boolean;
-  take_turn_after_silence_ms?: number;      // default 7000
-  end_conversation_after_silence_s?: number;  // default -1
-  max_conversation_duration_s?: number;     // default 600
+  take_turn_after_silence_s?: number;             // RENAMED from _ms, default 7 (seconds, not ms)
+  end_conversation_after_silence_s?: number;      // default -1
+  max_conversation_duration_s?: number;           // default 600
   max_conversation_duration_message?: string;
-  soft_timeout_s?: number;                  // default -1
+  max_duration_message_localized?: Record<string, string>;  // NEW — per-language
+  soft_timeout_s?: number;                        // default -1
+  llm_cascade_timeout_s?: number;                 // NEW — default 8
   filter_background_speech_enabled?: boolean;
-  asr_model?: string;
-  user_input_audio_format?: string;
+  asr_model?: 'original' | 'scribe_realtime_v2_1';  // UPDATED — exact enum values confirmed
+  user_input_audio_format?: 'pcm_8000' | 'pcm_16000' | 'pcm_22050' | 'pcm_24000' | 'pcm_44100' | 'pcm_48000' | 'ulaw_8000';  // UPDATED — 7 options
 
-  // Guardrails — NEW from co-browsing
+  // Multimodal input — NEW from co-browsing v1.5
+  allow_file_attachments?: boolean;               // images/PDFs in chat
+
+  // Client events — NEW from co-browsing v1.5
+  client_events?: Array<'audio'|'interruption'|'user_transcript'|'agent_response'|'agent_response_correction'|'agent_response_metadata'|'agent_chat_response_part'|'agent_tool_request'|'agent_tool_response'|'vad_score'|'guardrail_triggered'>;
+
+  // First message localisation — NEW from co-browsing v1.5
+  first_message_localized?: Record<string, string>;  // {"hi": "...", "ta": "..."}
+
+  // Guardrails — UPDATED from co-browsing v1.5 (card-based, sub-toggles)
   guardrails_focus_enabled?: boolean;
   guardrails_focus_config?: object;
   guardrails_manipulation_enabled?: boolean;
+  guardrails_prompt_injection?: boolean;          // NEW — sub-toggle in Manipulation drawer
+  guardrails_content_enabled?: boolean;           // NEW — Content guardrail card
+  guardrails_custom_prompt?: string;              // NEW — Custom guardrail text
+
+  // Privacy — NEW from co-browsing v1.5
+  zero_retention_mode?: boolean;
+  store_call_audio?: boolean;
+  conversations_retention_days?: number;
 
   // Overrides — NEW from co-browsing
   allowed_overrides?: string[];   // 'first_message'|'system_prompt'|'llm'|'voice'|'voice_speed'|'voice_stability'|'voice_similarity'|'text_only'
@@ -2985,8 +3534,9 @@ export class UpdateAgentConfigDto {
   rag_chunk_limit?: number;           // default 20
   rag_vector_distance_limit?: number;
   rag_num_candidates_enabled?: boolean;
-  rag_num_candidates?: number;
+  rag_num_candidates_value?: number;  // renamed from rag_num_candidates — min 100 recommended
   rag_query_rewrite_enabled?: boolean;
+  rag_query_rewrite_prompt?: string;  // NEW — custom rewrite prompt when enabled
 
   // Evaluation & Data Collection — NEW from co-browsing
   evaluation_criteria_json?: Array<{name: string, prompt: string}>;
@@ -3040,69 +3590,247 @@ GET /conversations/:id  // returns: summary, call_successful, how_call_ended, us
                          // data_collection_results
 ```
 
-### 6.2D — Agent Creation Wizard API (NEW — observed live from ElevenLabs co-browsing)
+### 6.2D — Agent Creation APIs: Two Distinct Paths (CO-BROWSING §1 + §7)
 
-The "+New Agent" wizard (UI-SPEC §6.3A) requires a dedicated creation endpoint that combines all wizard inputs, generates a complete agent config via LLM, optionally crawls a website, and returns a fully pre-populated agent ready to publish.
+The "+New Agent" wizard has two mutually exclusive creation paths. Each has its own endpoint with distinct validation and behaviour. **Never conflate these two paths.**
+
+---
+
+#### 6.2D-A — Blank Agent Path: `POST /agents`
+
+The Blank Agent path is a **2-step minimal wizard** (Step 1: type selection → Step 2: name + chat only). No industry, no use case, no system prompt generation, no LLM call.
 
 ```typescript
-// AgentsModule — wizard creation endpoint
-// POST /agents/wizard
-export class CreateAgentWizardDto {
-  agent_type: 'conversational' | 'tools_assisted' | 'autonomous';  // Step 1
-  industry: string;          // Step 2 — e.g., 'healthcare_medical'
-  use_case: string;          // Step 3 — e.g., 'telehealth_support'
-  agent_name: string;        // Step 4 — required
-  main_goal: string;         // Step 4 — required, free text
-  website_url?: string;      // Step 4 — optional, triggers async URL crawl
-  kb_doc_ids?: string[];     // Step 3 — pre-selected KB doc IDs
-  chat_only?: boolean;       // Step 4 — text-only mode toggle
+// AgentsModule — blank agent creation (fast path)
+// POST /agents
+export class CreateAgentBlankDto {
+  agent_name: string;        // Required. Max 50 chars. Validated: minLength(1), maxLength(50).
+  text_only?: boolean;       // Optional. Default false. From "Chat only" toggle.
+  // NOTE: agent_type is always 'conversational' for blank path in v1.
+  // 'tools_assisted' and 'autonomous' blank paths follow in future iterations.
+}
+
+// Response
+{
+  agent_id: string,                        // UUID of newly created agent
+  config: {                                // Sparse config — most fields at defaults
+    system_prompt: '',                     // empty — user fills in Tab 1
+    first_message: '',                     // empty — user fills in Tab 1
+    text_only: boolean,                    // from dto.text_only
+    status: 'draft'
+  },
+  redirect_url: '/app/agents/{id}?tab=agent'  // land on Tab 1 (Agent) to start configuring
 }
 ```
 
-**Wizard endpoint logic:**
-1. Look up `agent_templates` where `agent_type + industry + use_case` match
-2. Call LLM (Claude Sonnet) with template + `{agent_name, main_goal, website_content}` → generate `system_prompt` + `first_message`
-3. Create `agents` row + `agent_configs` row with all generated content + template defaults
-4. If `kb_doc_ids` provided: attach docs to agent
-5. If `website_url` provided: spawn async crawl job → create KB doc → attach → update agent config (non-blocking)
-6. Return `{agent_id, config, redirect_url: /app/agents/{id}?tab=agent}`
+**Endpoint logic (blank path):**
+1. Create `agents` row: `{name, creation_path: 'blank', type: 'conversational', status: 'draft', text_only, tenant_id}`
+2. Create `agent_configs` row with all fields at defaults (system_prompt = '', first_message = '')
+3. Create `agent_branches` row: `{name: 'Main', traffic_split: 100, status: 'draft', is_live: false}`
+4. Return `{agent_id, config, redirect_url}`
+5. **No LLM call. No async jobs. Response time < 200ms.**
 
-**Website personalisation note:** The website URL crawl runs asynchronously post-creation. The agent is immediately usable. Tab 4 (KB) shows "Personalising from your website..." progress indicator until crawl completes (~30–60s for typical sites).
+---
+
+#### 6.2D-B — Guided Wizard Path: `POST /agents/wizard`
+
+The Guided (Business Agent) path is a **5-step wizard** (Type → Industry → Use Case → KB → Complete). Calls LLM to generate system_prompt + first_message. Optionally crawls website URL async.
+
+```typescript
+// AgentsModule — guided wizard creation
+// POST /agents/wizard
+export class CreateAgentWizardDto {
+  agent_type: 'conversational' | 'tools_assisted' | 'autonomous';  // Step 1 — wizard type
+  industry: string;           // Step 2 — validated against industry enum (see §6.2D-C below)
+  use_case: string;           // Step 3 — validated against use_case enum per industry
+  agent_name: string;         // Step 5 — required, max 50 chars
+  main_goal: string;          // Step 5 — required, free text, max 1000 chars
+  website_url?: string;       // Step 5 — optional, must be valid HTTPS URL
+  kb_doc_ids?: string[];      // Step 4 — IDs of KB docs selected in Ground step
+  text_only?: boolean;        // Step 5 — Chat only toggle, default false
+}
+
+// Response
+{
+  agent_id: string,
+  config: AgentConfig,         // fully pre-populated from LLM generation
+  redirect_url: string         // → /app/agents/{id}?tab=agent
+}
+```
+
+**Endpoint logic (guided path):**
+1. Validate `industry` and `use_case` against the enum lists in §6.2D-C
+2. Look up `agent_templates` WHERE `agent_type = dto.agent_type AND industry = dto.industry AND use_case = dto.use_case`
+3. Call LLM (Claude Sonnet — **not GPT-4o**, Claude is cheaper + better for structured prompts) with template + `{agent_name, main_goal, website_content: ''}` → generate `system_prompt` + `first_message`. Target latency: < 3s.
+4. Create `agents` row: `{name, creation_path: 'guided', type, industry, use_case, main_goal, website_url, text_only, status: 'draft'}`
+5. Create `agent_configs` row with: `{system_prompt, first_message, ...template_defaults}`
+6. If `kb_doc_ids` provided: attach all docs to agent
+7. Create `agent_branches` row: `{name: 'Main', traffic_split: 100, status: 'draft'}`
+8. If `website_url` provided: **fire async job** (do not block response) → crawl URL → create KB doc → attach to agent → push WS notification "Website personalisation complete"
+9. Return `{agent_id, config, redirect_url}`
+
+**Website crawl async job:**
+- Queue: Redis BullMQ job `website_crawl`
+- Max crawl depth: 2 levels, max 50 pages
+- On completion: create `knowledge_base_docs` row, attach to agent, emit WebSocket event `{type: 'website_crawl_complete', agent_id}`
+- Tab 4 (KB) shows spinner with "Personalising from your website..." until WS event arrives
+
+---
+
+#### 6.2D-C — Industry and Use Case Enum Validation
+
+Both `industry` and `use_case` fields on the wizard DTO are validated against these enum lists.  
+**Source of truth for the wizard Step 2 and Step 3 screens. Also used to seed `agent_templates`.**
+
+**Industry slugs (22 total — 17 ElevenLabs baseline + 5 TRUSTNOW BPO-specific):**
+
+```typescript
+export const INDUSTRY_SLUGS = [
+  // 17 ElevenLabs baseline industries (confirmed live co-browsing §7.3)
+  'retail_ecommerce',
+  'healthcare_medical',
+  'finance_banking',
+  'real_estate',
+  'education_training',
+  'hospitality_travel',
+  'automotive',
+  'professional_services',
+  'technology_software',
+  'government_public',
+  'food_beverage',
+  'manufacturing',
+  'fitness_wellness',
+  'legal_services',
+  'nonprofit',
+  'media_entertainment',
+  'other',
+  // 5 TRUSTNOW BPO-specific verticals (TRUSTNOW differentiator — not in ElevenLabs)
+  'bpo_debt_collections',         // Debt collection / credit control outreach
+  'bpo_utilities',                // Utility company customer service (billing, outages, meter reading)
+  'bpo_insurance_claims',         // Insurance FNOL, claims intake, claims status
+  'bpo_telecoms',                 // Telecom customer service (billing, tech support, upgrades)
+  'bpo_government_services',      // Government service delivery (benefits, applications, queries)
+] as const;
+
+export type IndustrySlug = typeof INDUSTRY_SLUGS[number];
+```
+
+**Use case slugs per industry — universal set (always present in every industry):**
+```typescript
+export const UNIVERSAL_USE_CASES = [
+  'customer_support',
+  'outbound_sales',
+  'learning_development',
+  'scheduling',
+  'lead_qualification',
+  'answering_service',
+] as const;
+```
+
+**Industry-specific use case additions (confirmed from §7.4 co-browsing):**
+```typescript
+export const INDUSTRY_USE_CASES: Record<IndustrySlug, string[]> = {
+  retail_ecommerce:        [...UNIVERSAL_USE_CASES, 'product_recommendations','order_tracking','returns_exchanges','lead_generation','loyalty_programs','other'],
+  healthcare_medical:      [...UNIVERSAL_USE_CASES, 'appointment_scheduling','patient_intake','symptom_guidance','insurance_verification','prescription_reminders','telehealth_support','other'],
+  finance_banking:         [...UNIVERSAL_USE_CASES, 'account_inquiries','loan_applications','fraud_alerts','investment_guidance','bill_payment_support','financial_planning','other'],
+  real_estate:             [...UNIVERSAL_USE_CASES, 'property_search','viewing_appointments','market_information','mortgage_guidance','listing_information','other'],
+  education_training:      [...UNIVERSAL_USE_CASES, 'student_enrollment','course_recommendations','tutoring_support','campus_information','career_guidance','learning_companion','other'],
+  hospitality_travel:      [...UNIVERSAL_USE_CASES, 'reservation_management','concierge_services','guest_services','travel_planning','loyalty_programs','check_in_support','other'],
+  automotive:              [...UNIVERSAL_USE_CASES, 'vehicle_enquiries','test_drive_booking','service_maintenance','parts_accessories','finance_insurance','trade_in_support','other'],
+  professional_services:   [...UNIVERSAL_USE_CASES, 'consultation_booking','client_onboarding','project_enquiries','document_collection','invoice_billing','expert_matching','other'],
+  technology_software:     [...UNIVERSAL_USE_CASES, 'technical_support','product_demos','api_documentation','user_onboarding','feature_requests','sales_engineering','other'],
+  government_public:       [...UNIVERSAL_USE_CASES, 'citizen_services','permit_applications','information_requests','complaint_filing','service_eligibility','emergency_services','other'],
+  food_beverage:           [...UNIVERSAL_USE_CASES, 'order_taking','reservation_management','menu_recommendations','delivery_tracking','loyalty_programs','nutritional_information','other'],
+  manufacturing:           [...UNIVERSAL_USE_CASES, 'inventory_management','quality_control','maintenance_scheduling','safety_protocols','production_planning','supplier_communication','other'],
+  fitness_wellness:        [...UNIVERSAL_USE_CASES, 'class_booking','workout_planning','nutrition_guidance','progress_tracking','membership_management','wellness_coaching','other'],
+  legal_services:          [...UNIVERSAL_USE_CASES, 'consultation_scheduling','case_intake','legal_resources','billing_inquiries','document_preparation','case_updates','other'],
+  nonprofit:               [...UNIVERSAL_USE_CASES, 'volunteer_coordination','donation_processing','program_information','event_management','beneficiary_support','impact_reporting','other'],
+  media_entertainment:     [...UNIVERSAL_USE_CASES, 'content_recommendations','subscription_management','technical_support','event_information','fan_engagement','content_discovery','other'],
+  other:                   [...UNIVERSAL_USE_CASES, 'other'],
+  // BPO-specific verticals (TRUSTNOW differentiator)
+  bpo_debt_collections:    [...UNIVERSAL_USE_CASES, 'debt_collection_outreach','payment_arrangement','dispute_resolution','skip_tracing_support','regulatory_compliance_scripting','payment_confirmation','other'],
+  bpo_utilities:           [...UNIVERSAL_USE_CASES, 'billing_enquiries','outage_reporting','meter_reading_capture','service_connection_disconnection','tariff_switching','payment_plan_setup','other'],
+  bpo_insurance_claims:    [...UNIVERSAL_USE_CASES, 'fnol_first_notice_of_loss','claims_status_update','claims_document_collection','claims_triage','settlement_explanation','fraud_referral','other'],
+  bpo_telecoms:            [...UNIVERSAL_USE_CASES, 'bill_shock_resolution','contract_upgrade','technical_fault_logging','network_outage_support','roaming_queries','churn_prevention','other'],
+  bpo_government_services: [...UNIVERSAL_USE_CASES, 'benefits_eligibility_check','application_status','document_submission_guidance','appointment_booking','complaint_escalation','service_signposting','other'],
+};
+```
+
+**Validation rule:** If `industry` is not in `INDUSTRY_SLUGS`, return HTTP 422. If `use_case` is not in `INDUSTRY_USE_CASES[industry]`, return HTTP 422 with message: "Use case '{use_case}' is not valid for industry '{industry}'".
+
+---
+
+#### 6.2D-D — `agent_templates` Seed Data Scope (Updated)
+
+Seed `agent_templates` for **all 22 industries** (not just 7). Priority order for launch:
+
+**Tier 1 — Launch critical (seed before go-live):**
+- All 5 BPO-specific industries × top 6 use cases = **30 templates**
+- Healthcare × 6, Finance × 6, Technology × 6 = **18 templates**
+
+**Tier 2 — Complete within first sprint post-launch:**
+- Remaining 14 ElevenLabs-baseline industries × 6 use cases each = **84 templates**
+
+**Minimum viable seed for beta:** 48 templates (Tier 1).  
+**Full coverage for GA:** 132+ templates.
+
+Each template's `system_prompt_template` must be 800–1,500 chars, professional, role-specific, with `{{agent_name}}`, `{{company_name}}`, `{{industry}}`, `{{use_case}}`, `{{main_goal}}`, `{{website_content}}` placeholders. Write these as a separate `seed-agent-templates.sql` file during Task 6.
+
+**EXCEED ELEVENLABS — Template quality standard:**
+ElevenLabs generates generic prompts. TRUSTNOW templates for BPO verticals must include:
+- Regulatory compliance language (e.g., FDCPA phrasing for debt collection, HIPAA-safe language for healthcare)
+- Industry-specific call structure (opening identification, purpose statement, consent capture where required)
+- Escalation trigger conditions (when to transfer to human)
+- Call disposition vocabulary aligned to the industry (e.g., "Promise to Pay" for collections, "FNOL accepted" for insurance)
+
+This makes TRUSTNOW's AI agents meaningfully better for BPO clients than ElevenLabs' generic templates.
 
 ### 6.2E — Agent Templates — Seed Data (REQUIRED for wizard to function)
 
-Seed the `agent_templates` table with minimum 21 templates at launch. Priority industries and use cases for BPO/contact centre:
+**See §6.2D-D for full seeding strategy and §6.2D-C for industry/use-case enum reference.**
+
+Seed `agent_templates` in two tiers:
+
+**Tier 1 — Launch critical (48 templates minimum, must be seeded before beta):**
 
 ```sql
--- Priority seed templates (21 minimum for launch)
--- Format: (agent_type, industry, use_case, system_prompt_template, first_message_template)
+-- Seed file: seed-agent-templates.sql (written in full during Task 6)
+-- Format: INSERT INTO agent_templates (agent_type, industry, use_case, is_bpo_specific,
+--           system_prompt_template, first_message_template) VALUES (...)
 
--- Healthcare × 3 use cases
-INSERT INTO agent_templates (agent_type, industry, use_case, system_prompt_template, first_message_template, ...) VALUES
-('conversational', 'healthcare_medical', 'telehealth_support',
-  'You are {{agent_name}}, a professional telehealth support agent for {{company_name}}. Your goal: {{main_goal}}. You help patients with medical queries, appointment scheduling, and health guidance. Always recommend consulting a qualified doctor for medical decisions.',
-  'Hello! I am {{agent_name}} from {{company_name}}. I am here to assist with your healthcare needs. How may I help you today?'),
-('conversational', 'healthcare_medical', 'appointment_scheduling', ...),
-('conversational', 'healthcare_medical', 'patient_intake', ...),
+-- BPO Debt Collections × 6 use cases (is_bpo_specific = true)
+('conversational','bpo_debt_collections','customer_support', true,
+  'You are {{agent_name}}, a professional customer service representative for {{company_name}}, a debt collection agency. Your goal: {{main_goal}}. You must always identify yourself and your company at the start of every call. You are calling about an outstanding account. You must follow all applicable consumer protection regulations. Never threaten, harass, or use abusive language. If the consumer disputes the debt, note the dispute and advise them of their rights.',
+  'Good [morning/afternoon], may I speak with [customer name]? This is {{agent_name}} calling from {{company_name}} regarding an important account matter. Is this a convenient time to speak?'),
+-- ('conversational','bpo_debt_collections','debt_collection_outreach', true, ...) × 5 more use cases
 
--- Finance × 3 use cases
-('conversational', 'finance_banking', 'customer_support', ...),
-('conversational', 'finance_banking', 'lead_qualification', ...),
-('conversational', 'finance_banking', 'answering_service', ...),
+-- BPO Utilities × 6 use cases (is_bpo_specific = true)
+-- BPO Insurance Claims × 6 use cases (is_bpo_specific = true)
+-- BPO Telecoms × 6 use cases (is_bpo_specific = true)
+-- BPO Government Services × 6 use cases (is_bpo_specific = true)
 
--- Retail × 3 use cases
-('conversational', 'retail_ecommerce', 'customer_support', ...),
-('conversational', 'retail_ecommerce', 'outbound_sales', ...),
-('conversational', 'retail_ecommerce', 'lead_qualification', ...),
+-- Healthcare × 6 use cases
+('conversational','healthcare_medical','telehealth_support', false,
+  'You are {{agent_name}}, a professional telehealth support agent for {{company_name}}. Your goal: {{main_goal}}. You help patients with medical queries, appointment scheduling, and health guidance. Always recommend consulting a qualified doctor for clinical decisions. Never diagnose conditions.',
+  'Hello, thank you for calling {{company_name}}. My name is {{agent_name}} and I am here to assist with your healthcare needs today. How may I help you?'),
+-- × 5 more healthcare use cases
 
--- Education × 3
--- Hospitality × 3
--- Technology × 3
--- Professional Services × 3
+-- Finance × 6 use cases
+-- Technology × 6 use cases
 ;
 ```
 
-Full template content to be written as a separate `seed-agent-templates.sql` file during Task 6. Each template's system_prompt_template should be 800–1500 chars, professional, role-specific, with `{{placeholders}}` for the wizard inputs.
+**EXCEED ELEVENLABS — BPO template quality bar:**
+- Regulatory phrasing embedded in prompts (FDCPA for collections, HIPAA-safe for healthcare, FCA-compliant for finance)
+- Industry-standard call opening/closing scripts
+- Explicit escalation trigger conditions in system prompt
+- Disposition vocabulary aligned to industry (Promise to Pay, FNOL, Churn Save, Service Reconnect)
+- Compliance guardrails woven into the prompt, not bolted on afterwards
+
+Full template SQL (800–1,500 chars per system_prompt_template) is written as `seed-agent-templates.sql` during Task 6.
+
+**Tier 2 — Complete by GA (remaining 14 standard industries × 6 use cases = 84 additional templates):**
+Retail, Real Estate, Education, Hospitality, Automotive, Professional Services, Government, Food & Beverage, Manufacturing, Fitness, Legal, Non-Profit, Media & Entertainment, Other × 6 use cases each.
 
 ### 6.3 — RBAC: Six Standard Tenant Roles (BRD-L5-RB-001)
 - `platform_admin` — TRUSTNOW ops, full platform visibility
@@ -3114,31 +3842,2851 @@ Full template content to be written as a separate `seed-agent-templates.sql` fil
 
 ---
 
+### 6.2F — Additional AgentsModule Endpoint Contracts (CO-BROWSING §2)
 
-## TASK 7 — TELEPHONY (FreeSWITCH + LiveKit)
+#### `POST /agents/:id/translate-first-message`
 
-**Prerequisite: Task 6 complete + TLS certificates in place.**
+**Module:** AgentsModule (not WidgetModule — corrected from route table)  
+**Purpose:** Translate the agent's default first message to all additional configured languages. Populates `agent_configs.first_message_localized` map.  
+**Trigger:** User clicks "Translate to all" button in Tab 1 First Message toolbar.
+
+```typescript
+// POST /agents/:id/translate-first-message
+// No request body — operates on the agent's existing first_message and languages config
+
+// Guards: tenant_id RLS, agent_admin or above
+// Behaviour:
+// 1. Load agent_configs: first_message (source), additional_languages[]
+// 2. If additional_languages is empty → return HTTP 400 "No additional languages configured"
+// 3. For each language in additional_languages:
+//    a. Call translation service (LibreTranslate self-hosted OR DeepL API)
+//       with {text: first_message, source_lang: primary_language, target_lang: language_code}
+//    b. Store translated text in first_message_localized[language_code]
+// 4. UPDATE agent_configs SET first_message_localized = {...merged...} WHERE agent_id = :id
+// 5. Return updated first_message_localized map
+
+// Response 200
+{
+  first_message_localized: Record<string, string>;  // e.g. {"hi": "...", "ta": "..."}
+  translated_languages: string[];                    // list of language codes translated
+  source_language: string;                           // e.g. "en"
+}
+
+// Response 400
+{ error: "No additional languages configured. Add languages in the Language section first." }
+```
+
+**Translation service note:** Use LibreTranslate (self-hosted, Partition B compatible, zero data egress) as the primary translation engine. DeepL API as Partition A alternative. Both are abstracted behind a `TranslationService` interface. **Do not use Google Translate — it requires sharing call content with Google.**
+
+**EXCEED ELEVENLABS:** ElevenLabs offers translate-to-all as a single-button action with no visibility into translations. TRUSTNOW must additionally show each translated result inline below the textarea (per-language collapsible rows) so the agent_admin can review and edit individual translations before saving.
 
 ---
 
-### ▶ PLATFORM ENGINEER — SESSION START INSTRUCTIONS FOR TASK 7
+#### `PUT /agents/:id/config` — DTO Additions (CO-BROWSING §2)
 
-Read RUNBOOK.md and confirm Task 6 is ✅ COMPLETE before starting. Run the standard session start health check (`uname -r && uptime && df -h && free -h`) and report server state. Then proceed through §7.1–§7.14 in sequence without skipping steps. Run every VERIFY block before moving to the next section. If anything fails, stop and report immediately — do not attempt to work around errors.
+Add the following fields to `UpdateAgentConfigDto` (they are in the schema but missing from the DTO):
 
-This task builds the telephony layer (Layer 4): FreeSWITCH for SIP/PSTN and LiveKit for WebRTC. It also builds the dual-protocol human handoff service as a NestJS module and a Python helper. After all verifications pass, update RUNBOOK.md and report back to Architect.
-
-**Files created in this task:**
-- `config/freeswitch/` — All FreeSWITCH configuration (bind-mounted into container)
-- `config/livekit/config.yaml` — LiveKit configuration
-- `services/platform-api/src/telephony/` — NestJS EslService + HandoffModule
-- `services/ai-pipeline/handoff_service.py` — Python handoff helper (AI pipeline side)
-- `config/freeswitch/docker-compose.yml` — FreeSWITCH container definition
+```typescript
+// Add to UpdateAgentConfigDto
+timezone_variable_enabled?: boolean;    // "Set timezone" button was used — {timezone} injected
+expressive_mode_dismissed?: boolean;    // User dismissed Expressive Mode promo card
+first_message_localized?: Record<string, string>;  // already present ✅ — confirm
+```
 
 ---
 
-### §7.1 — FreeSWITCH Installation (Docker — Ubuntu 24.04 Compatible)
+### 6.2G — WidgetModule Endpoint Contracts (CO-BROWSING §3)
 
-FreeSWITCH packages are no longer available via a public apt repo for Ubuntu 24.04 Noble. Use the official Docker image — consistent with the rest of the stack.
+**Naming note:** `widget_configs.feedback_enabled` is the authoritative field name in the schema (set during IMPL-001 v3.0). The co-browsing §3.2 referred to it as `feedback_collection_enabled` — that is descriptive language only, not the column name. Field name stays `feedback_enabled`.
+
+---
+
+#### `PUT /agents/:id/widget`
+
+**Module:** WidgetModule  
+**Purpose:** Create or fully replace the widget configuration for an agent. Upsert pattern — if no `widget_configs` row exists, creates one; otherwise replaces all provided fields.
+
+```typescript
+// PUT /agents/:id/widget
+export class UpdateWidgetConfigDto {
+  // Setup
+  feedback_enabled?: boolean;                     // 1–5 star CSAT post-call rating
+
+  // Interface toggles (8 total)
+  interface_chat_mode?: boolean;
+  interface_send_text_on_call?: boolean;
+  interface_realtime_transcript?: boolean;
+  interface_language_dropdown?: boolean;
+  interface_mute_button?: boolean;
+  interface_action_indicator?: boolean;
+  interface_show_conversation_id?: boolean;
+  interface_hide_audio_tags?: boolean;
+  expanded_behavior?: 'starts_collapsed' | 'starts_expanded' | 'always_expanded';
+
+  // Markdown links
+  allow_all_domains?: boolean;
+  allowed_domains?: string[];
+  include_www_variants?: boolean;
+  allow_http_links?: boolean;
+
+  // Avatar
+  avatar_type?: 'orb' | 'link' | 'image';
+  avatar_orb_color_1?: string;        // hex, e.g. '#2792dc'
+  avatar_orb_color_2?: string;        // hex, e.g. '#9ce6e6'
+  avatar_image_url?: string;          // external URL (link type) or CDN URL (image type, set by upload endpoint)
+
+  // Style section
+  collapsible?: boolean;
+  placement?: 'bottom_right' | 'bottom_left' | 'top_right' | 'top_left';
+  style_config?: {
+    base?: string;
+    base_hover?: string;
+    base_active?: string;
+    base_border?: string;
+    base_subtle?: string;
+    base_primary?: string;
+    accent_border?: string;
+    accent_subtle?: string;
+    accent_primary?: string;
+    overlay_padding?: string;   // CSS value e.g. '32px'
+    button_radius?: string;     // CSS value e.g. '18px'
+    input_radius?: string;
+    bubble_radius?: string;
+    sheet_radius?: string;
+    compact_sheet_radius?: string;
+  };
+  code_block_theme?: 'auto' | 'light' | 'dark';
+
+  // Text contents (i18n tokens)
+  text_contents?: Record<string, string>;  // partial or full token map
+
+  // Shareable page
+  shareable_description?: string;
+  require_terms_on_shareable?: boolean;
+}
+
+// Response 200
+{
+  widget_id: string,
+  agent_id: string,
+  updated_at: string   // ISO timestamp
+}
+```
+
+**Logic:**
+1. Validate `agent_id` belongs to `tenant_id` (RLS check)
+2. `UPSERT widget_configs` on conflict `(agent_id)` — update all provided fields, leave others unchanged
+3. Return `{widget_id, agent_id, updated_at}`
+4. **Do NOT auto-save on every keystroke** — widget config is saved only on explicit PUT. Frontend debounces by 1.5s or saves on field blur.
+
+---
+
+#### `POST /agents/:id/widget/avatar`
+
+**Module:** WidgetModule  
+**Purpose:** Upload an avatar image (Image type). Stores to MinIO `trustnow-widget-assets` bucket, sets `widget_configs.avatar_image_url` to the CDN URL, sets `widget_configs.avatar_type = 'image'`.
+
+```typescript
+// POST /agents/:id/widget/avatar
+// Content-Type: multipart/form-data
+// Field: file (binary image)
+
+// Validation:
+// - Max file size: 2MB (2,097,152 bytes)
+// - Accepted MIME types: image/jpeg, image/png, image/webp, image/gif
+// - Recommended resolution hint: 172×172px (not enforced — just displayed in UI)
+
+// Logic:
+// 1. Validate file size + MIME type
+// 2. Generate storage key: widget-avatars/{tenant_id}/{agent_id}/{uuid}.{ext}
+// 3. Upload to MinIO bucket 'trustnow-widget-assets'
+// 4. Generate CDN URL: https://cdn.trustnow.ai/widget-assets/{key}
+// 5. UPDATE widget_configs SET avatar_image_url = {cdn_url}, avatar_type = 'image'
+// 6. Return cdn_url
+
+// Response 200
+{
+  avatar_url: string   // CDN URL e.g. 'https://cdn.trustnow.ai/widget-assets/...'
+}
+
+// Response 413 — file too large
+{ error: "File size exceeds 2MB limit." }
+
+// Response 415 — unsupported type
+{ error: "Unsupported file type. Upload a JPEG, PNG, WebP, or GIF image." }
+```
+
+---
+
+#### `GET /agents/:id/widget/shareable-url`
+
+**Module:** WidgetModule  
+**Purpose:** Returns the public shareable page URL for this agent — the standalone page where anyone can interact with the agent without embedding.
+
+```typescript
+// GET /agents/:id/widget/shareable-url
+// No request body
+
+// Logic:
+// 1. Confirm agent exists + belongs to tenant
+// 2. Confirm agent status is not 'archived'
+// 3. Return shareable URL
+
+// Response 200
+{
+  shareable_url: string,   // e.g. 'https://app.trustnow.ai/agent/agent_XXXXXXXX'
+  is_live: boolean         // true if agent has a live branch with traffic > 0
+}
+```
+
+**Shareable URL format:** `https://app.trustnow.ai/agent/{agent_id}` — publicly accessible, no login required.  
+This page renders the widget with the agent's current `widget_configs` and the agent's published (Live) configuration.  
+**If agent has no Live branch:** page shows "This agent is not yet available. Check back soon." with no widget.
+
+---
+
+#### `GET /agents/:id/widget`
+
+**Module:** WidgetModule  
+**Purpose:** Returns current widget configuration for populating the Widget tab UI.
+
+```typescript
+// GET /agents/:id/widget
+// Response 200: full widget_configs row as JSON
+// Response 404: { error: "Widget config not found" } — happens if never PUT'd; frontend creates defaults
+```
+
+---
+
+**EXCEED ELEVENLABS — Widget tab additions:**
+ElevenLabs provides one embed code snippet. TRUSTNOW must additionally provide:
+1. **Framework-specific code tabs**: JavaScript (raw) | React | Vue | Angular — each showing the correct import/usage pattern for that framework
+2. **Version pinning** option in embed code: ability to pin to a specific widget JS version (e.g. `embed@v1.2.0`) so clients are not auto-upgraded
+3. **CSP (Content Security Policy) helper**: show the exact `script-src`, `connect-src`, `frame-src` policy strings the client site needs to allow the widget. BPO clients' IT security teams always ask for this.
+
+---
+
+**ARCH-001 FLAG — New architectural component: TRUSTNOW Widget CDN Bundle**  
+The `<trustnow-agent>` Web Component (`cdn.trustnow.ai/widget/embed.js`) is a **separate build artifact** from the main platform frontend. It requires:
+- Dedicated Vite/Rollup build pipeline outputting a single-file Web Component bundle
+- CDN deployment (CloudFront + S3 or MinIO with edge caching)
+- Semantic versioning + changelog
+- CORS headers: `Access-Control-Allow-Origin: *` (widget must load on any client domain)
+- CSP compatibility: no `eval()`, no inline scripts (strict CSP compliant)
+- This is Layer 5 (CX OS) — client-facing delivery layer
+See ARCH-001 §Widget CDN Component (to be added).
+
+---
+
+### 6.2H — Advanced Tab (Tab 10) Backend Service Specs (CO-BROWSING §4)
+
+#### Conversation Retention Purge Job
+
+The `conversations_retention_days` field requires a background purge service. Without this, setting a retention period in the UI has no effect.
+
+```typescript
+// NestJS Scheduled Task — runs daily at 03:00 UTC
+// File: src/scheduler/retention-purge.job.ts
+@Cron('0 3 * * *')
+async purgeExpiredConversations() {
+  // 1. Find all agent_configs where conversations_retention_days > 0
+  const agents = await this.db.query(`
+    SELECT DISTINCT agent_id, conversations_retention_days
+    FROM agent_configs
+    WHERE conversations_retention_days > 0
+  `);
+
+  for (const agent of agents) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - agent.conversations_retention_days);
+
+    // 2. Find expired conversations for this agent
+    const expired = await this.db.query(`
+      SELECT conversation_id, recording_url
+      FROM conversations
+      WHERE agent_id = $1 AND started_at < $2
+    `, [agent.agent_id, cutoff]);
+
+    for (const conv of expired) {
+      // 3. Delete audio from MinIO if present
+      if (conv.recording_url) {
+        await this.minioService.deleteObject(conv.recording_url);
+      }
+      // 4. Delete conversation record (cascades to transcript, feedback, etc.)
+      await this.db.query(
+        'DELETE FROM conversations WHERE conversation_id = $1',
+        [conv.conversation_id]
+      );
+    }
+
+    this.logger.log(
+      `Retention purge: agent=${agent.agent_id} deleted=${expired.length} conversations`
+    );
+  }
+}
+```
+
+**Purge scope per deleted conversation:**
+- `conversations` row (and all FK-cascaded child rows)
+- MinIO recording audio file (if `store_call_audio` was true)
+- TimescaleDB MIS aggregations (if conversation data fed into them — leave aggregates, delete raw)
+- Qdrant vectors if the conversation generated any KB embeddings from call content
+
+**Log to `audit_log`:** Every purge batch must generate an audit log entry: `{action: 'retention_purge', agent_id, count, cutoff_date, purged_at}`
+
+---
+
+#### Audio Format Auto-Selection for SIP Agents
+
+When an agent has a SIP trunk assigned (via Phone Numbers), the platform must auto-set the correct audio format without requiring manual configuration.
+
+```typescript
+// AgentsModule — called when a SIP trunk is assigned to an agent
+async onSipTrunkAssigned(agent_id: string, trunk_id: string) {
+  // SIP/PSTN audio is always μ-law 8000 Hz
+  await this.db.query(`
+    UPDATE agent_configs
+    SET user_input_audio_format = 'ulaw_8000'
+    WHERE agent_id = $1
+  `, [agent_id]);
+
+  // Emit WebSocket event so UI shows "Auto-configured for SIP" badge
+  this.wsGateway.emit(agent_id, {
+    type: 'config_auto_updated',
+    field: 'user_input_audio_format',
+    value: 'ulaw_8000',
+    reason: 'SIP trunk assigned — μ-law 8000 Hz required for SIP/PSTN'
+  });
+}
+
+// Similarly: when SIP trunk is removed, revert to WebRTC default
+async onSipTrunkRemoved(agent_id: string) {
+  await this.db.query(`
+    UPDATE agent_configs
+    SET user_input_audio_format = 'pcm_16000'
+    WHERE agent_id = $1
+  `, [agent_id]);
+}
+```
+
+---
+
+#### PII Redaction Service (TRUSTNOW EXCEED ELEVENLABS — CO-BROWSING §4.7 extension)
+
+ElevenLabs has no PII redaction. TRUSTNOW adds it as a BPO compliance feature.
+
+```typescript
+// PII Redaction runs post-call on the transcript, before it is stored in PostgreSQL
+// Triggered when: agent_configs.pii_redaction_enabled = true AND call ends
+
+// PII patterns to redact (UK/US/AU/IN coverage for BPO markets):
+const PII_PATTERNS = [
+  { pattern: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, label: '[CARD_NUMBER]' },
+  { pattern: /\b\d{3}[-.]?\d{2}[-.]?\d{4}\b/g, label: '[SSN]' },                    // US SSN
+  { pattern: /\b[A-Z]{2}\d{6}[A-Z]\b/gi, label: '[NI_NUMBER]' },                    // UK NI
+  { pattern: /\b0[17]\d{9}\b/g, label: '[PHONE_NUMBER]' },                           // UK mobile
+  { pattern: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, label: '[EMAIL]' },
+  { pattern: /\b(0[1-9]|[12]\d|3[01])[\/\-](0[1-9]|1[012])[\/\-](19|20)\d{2}\b/g, label: '[DOB]' },
+  { pattern: /\b\d{4,}\b(?=.*account)/gi, label: '[ACCOUNT_NUMBER]' },               // contextual
+  { pattern: /\b[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}\b/gi, label: '[POSTCODE]' },  // UK postcode
+];
+
+async redactPii(transcript_json: TranscriptJson): Promise<TranscriptJson> {
+  return transcript_json.map(turn => ({
+    ...turn,
+    text: PII_PATTERNS.reduce(
+      (text, {pattern, label}) => text.replace(pattern, label),
+      turn.text
+    )
+  }));
+}
+```
+
+**PII redaction scope:** Applied to `transcript_json` BEFORE writing to `conversations` table. The raw (unredacted) transcript is never persisted to disk when `pii_redaction_enabled = true`. Audio recordings are separate — if both `pii_redaction_enabled` AND `store_call_audio = false`, no data containing PII is retained.
+
+**DTO addition for `UpdateAgentConfigDto`:**
+```typescript
+pii_redaction_enabled?: boolean;             // Tab 10 Privacy — TRUSTNOW BPO extension
+soft_timeout_message?: string;               // filler message during LLM wait
+soft_timeout_message_localized?: Record<string, string>;  // per-language
+```
+
+---
+
+### 6.2I — SecurityModule Endpoint Contracts (CO-BROWSING §5)
+
+#### `POST /api/auth/session-token`
+
+**Module:** SecurityModule / AuthModule  
+**Purpose:** The widget JWT session token endpoint. When `authentication_enabled = true` on an agent, the `<trustnow-agent>` Web Component cannot connect directly. Instead, the caller's session must be validated by the **client's backend**, which calls TRUSTNOW to obtain a short-lived signed JWT, then passes it to the widget.
+
+**Full flow (confirmed live §5.1):**
+```
+1. Caller loads client website → <trustnow-agent agent-id="X"> renders
+2. Widget JS detects authentication_enabled = true
+3. Widget JS calls: Client's backend → POST /trustnow-proxy/session (client-defined endpoint)
+4. Client backend authenticates the caller (their own login/session)
+5. Client backend calls: POST https://api.trustnow.ai/api/auth/session-token
+6. TRUSTNOW signs and returns: { token, expires_at }
+7. Client backend returns token to widget JS
+8. Widget JS presents token in WebSocket handshake header: Authorization: Bearer <token>
+9. TRUSTNOW WebSocket gateway validates token → accepts connection
+```
+
+```typescript
+// POST /api/auth/session-token
+// Called by client's BACKEND only — not from browser directly (would expose API key)
+// Authenticated by: API key (x-api-key header) OR tenant JWT
+
+export class CreateSessionTokenDto {
+  agent_id: string;              // which agent this session is for
+  user_id?: string;              // caller's user identifier (passed through to conversation record)
+  user_metadata?: Record<string, string>;  // arbitrary caller context (name, account, etc.)
+                                           // injected into agent's dynamic variables
+  ttl_seconds?: number;          // token lifetime, default 300 (5 mins), max 3600
+}
+
+// Response 200
+{
+  token: string,          // signed JWT (RS256 or HS256 using agent's jwt_config)
+  expires_at: string,     // ISO timestamp
+  agent_id: string
+}
+
+// Response 401 — invalid API key
+// Response 403 — agent not found or not owned by this tenant
+// Response 422 — authentication_enabled is false for this agent (token not needed)
+```
+
+**JWT payload:**
+```json
+{
+  "sub": "{user_id}",
+  "agent_id": "{agent_id}",
+  "tenant_id": "{tenant_id}",
+  "metadata": { "name": "John Smith", "account": "ACC123" },
+  "iat": 1712000000,
+  "exp": 1712000300
+}
+```
+
+**Security:** Token is single-use — once consumed by a WebSocket connection, it cannot be reused. Enforced via Redis: `SETNX session_token:{token_hash} 1 EX {ttl}`. Second use returns 401.
+
+---
+
+#### `PUT /agents/:id/security` (Security tab save)
+
+**Module:** SecurityModule  
+**Purpose:** Save all Security tab configuration fields in a single call.
+
+```typescript
+export class UpdateAgentSecurityDto {
+  // Authentication
+  authentication_enabled?: boolean;
+
+  // Guardrails (card-based — §5.2)
+  guardrails_focus_enabled?: boolean;
+  guardrails_manipulation_enabled?: boolean;
+  guardrails_prompt_injection?: boolean;        // sub-toggle within Manipulation drawer
+  guardrails_content_enabled?: boolean;
+  guardrails_custom_prompt?: string;            // Custom card — free text guardrail
+
+  // Allowlist (§5.3)
+  allowed_hosts?: string[];                     // domains that may connect to this agent
+
+  // Overrides (§5.4)
+  allowed_overrides?: Array<
+    'first_message' | 'system_prompt' | 'llm' | 'voice' |
+    'voice_speed' | 'voice_stability' | 'voice_similarity' | 'text_only'
+  >;
+
+  // Webhooks (§5.5)
+  conversation_initiation_webhook_enabled?: boolean;
+  conversation_initiation_webhook_url?: string;
+  post_call_webhook_url?: string;
+  post_call_webhook_secret?: string;            // HMAC secret for payload signing
+}
+
+// Logic: UPSERT auth_policies on conflict (agent_id). Also UPDATE agent_configs
+// for the guardrails fields (guardrails live on agent_configs not auth_policies).
+// Return: { updated_at: string }
+```
+
+**Field distribution — Security tab fields live on two tables:**
+
+| Field | Table |
+|-------|-------|
+| `authentication_enabled` | `auth_policies` |
+| `allowed_hosts` | `auth_policies` |
+| `allowed_overrides` | `auth_policies` |
+| `conversation_initiation_webhook_url` | `auth_policies` |
+| `post_call_webhook_url` | `auth_policies` |
+| `post_call_webhook_secret` | `auth_policies` |
+| `guardrails_*` | `agent_configs` |
+
+The `PUT /agents/:id/security` endpoint must write to both tables transactionally.
+
+---
+
+#### `POST /agents/:id/webhooks/post-call` (Create Webhook helper — "Create Webhook" button)
+
+**Module:** WebhooksModule  
+**Purpose:** When the user clicks `Create Webhook` on the Post-call Webhook section, this opens a guided webhook configuration dialog (test connection + save). This endpoint tests and registers the webhook.
+
+```typescript
+// POST /agents/:id/webhooks/post-call
+export class CreatePostCallWebhookDto {
+  url: string;              // Webhook URL (must be HTTPS)
+  secret?: string;          // Optional HMAC secret — if provided, payloads are signed
+  test?: boolean;           // When true: send a test POST to the URL, do not save
+}
+
+// Logic when test=true:
+// 1. Send a test payload to dto.url with a synthetic conversation summary
+// 2. Return: { success: boolean, http_status: number, response_time_ms: number }
+
+// Logic when test=false (save):
+// 1. Validate URL is reachable (optional pre-check)
+// 2. UPSERT auth_policies: post_call_webhook_url = dto.url, post_call_webhook_secret = dto.secret
+// 3. Return: { saved: true, url: dto.url }
+```
+
+**Test payload (same structure as live post-call payload):**
+```json
+{
+  "type": "post_call_webhook_test",
+  "agent_id": "{agent_id}",
+  "conversation_id": "test_conv_000",
+  "duration_s": 0,
+  "call_successful": true,
+  "transcript": [],
+  "timestamp": "{ISO now}"
+}
+```
+
+---
+
+#### `DELETE /agents/:id/webhooks/post-call`
+
+```typescript
+// Removes post_call_webhook_url and post_call_webhook_secret from auth_policies
+// Response 200: { deleted: true }
+```
+
+---
+
+**EXCEED ELEVENLABS — Security tab additions:**
+
+ElevenLabs security is basic (JWT + allowlist + guardrails). TRUSTNOW BPO clients need significantly stronger security controls:
+
+1. **Webhook signature verification UI:** When `post_call_webhook_secret` is set, show a code snippet in the UI showing exactly how to verify the `X-TRUSTNOW-Signature` header in the client's webhook receiver. Copy-paste ready. ElevenLabs documents this in docs only — TRUSTNOW surfaces it inline.
+
+2. **Allowlist validation state:** For each host in the allowlist, show a live "reachable" indicator (green dot = TRUSTNOW can reach the host, red = unreachable). Helps diagnose misconfigurations before they affect live callers.
+
+3. **Guardrail activity log:** Show a count badge on each guardrail card: "Triggered 12 times (last 7 days)". Clicking opens a filtered conversation list showing only conversations where that guardrail fired. Maps to `guardrail_triggered` client event stored in conversations table.
+
+4. **Override audit trail:** When a client uses an override (e.g., passes `text_only=true` at embed time), log which overrides were actually applied to each conversation. Visible in the conversation detail Metadata panel. BPO compliance teams need to know if callers were put into text-only mode and why.
+
+---
+
+### 6.2J — ToolsModule Endpoint Contracts (CO-BROWSING §6)
+
+#### Tools CRUD
+
+```typescript
+// POST /tools — create a new tool (Webhook or Client)
+export class CreateToolDto {
+  agent_id: string;                            // which agent this tool belongs to
+  name: string;                                // required, max 100 chars
+  description: string;                         // required — passed to LLM
+  type: 'webhook' | 'client' | 'integration';
+
+  // Webhook-only fields
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  url?: string;                                // supports {{env.VAR}} interpolation
+  auth_connection_id?: string;
+  headers?: Record<string, string>;
+  response_timeout_s?: number;                 // default 20
+
+  // Client-only fields
+  wait_for_response?: boolean;                 // default false
+
+  // All types
+  disable_interruptions?: boolean;             // default false
+  pre_tool_speech?: 'auto' | 'force';          // default 'auto'
+  execution_mode?: string;                     // default 'immediate'
+  tool_call_sound?: string;                    // default null
+  input_schema?: object;                       // JSON Schema for parameters
+  dynamic_variable_assignments?: object;
+  response_mocks?: object[];
+}
+
+// Response 201: { tool_id, agent_id, name, type, created_at }
+// Side effect: appends tool_id to agent_configs.tools_config_json.attached_tool_ids
+
+// GET /tools?agent_id=:id — list all tools for an agent
+// Response 200: Tool[]
+
+// PUT /tools/:id — update a tool (all CreateToolDto fields optional)
+// Response 200: { tool_id, updated_at }
+
+// DELETE /tools/:id — delete a tool
+// Side effect: removes tool_id from agent_configs.tools_config_json.attached_tool_ids
+// Response 200: { deleted: true }
+```
+
+#### `PUT /agents/:id/tools/system` — System Tool Toggles
+
+**Purpose:** Toggle individual system tools on/off. Updates `agent_configs.tools_config_json.system_tools`.
+
+```typescript
+export class UpdateSystemToolsDto {
+  // All optional — only provided keys are updated (PATCH semantics)
+  end_conversation?: boolean;
+  detect_language?: boolean;
+  skip_turn?: boolean;
+  transfer_to_agent?: boolean;
+  transfer_to_number?: boolean;
+  play_keypad_touch_tone?: boolean;
+  voicemail_detection?: boolean;
+}
+
+// Logic:
+// 1. Load current tools_config_json.system_tools
+// 2. Merge provided fields
+// 3. UPDATE agent_configs SET tools_config_json = jsonb_set(...) WHERE agent_id = :id
+// 4. Return updated system_tools object + active_count
+
+// Response 200
+{
+  system_tools: Record<string, boolean>,
+  active_count: number   // count of true values — drives the "N active tools" badge in UI
+}
+```
+
+#### MCP Server CRUD
+
+```typescript
+// POST /mcp-servers — create a custom MCP server
+export class CreateMcpServerDto {
+  agent_id?: string;           // null = workspace-level server (shared across agents)
+  name: string;
+  description?: string;
+  server_type: 'sse' | 'streamable_http';
+  server_url: string;          // supports {{env.VAR}} interpolation
+  auth_connection_id?: string;
+  headers?: Record<string, string>;
+  // Note: terms_accepted handled separately by POST /mcp-servers/accept-terms
+}
+
+// Response 201: { mcp_server_id, name, server_type, created_at }
+
+// GET /mcp-servers?agent_id=:id — list MCP servers available to this agent
+// Returns: workspace-level servers (agent_id IS NULL) + agent-specific servers
+
+// DELETE /mcp-servers/:id
+// Response 200: { deleted: true }
+```
+
+#### `POST /mcp-servers/accept-terms` — MCP Terms Acceptance
+
+**Purpose:** Records workspace-level MCP terms acceptance (shown once per workspace).
+
+```typescript
+// POST /mcp-servers/accept-terms
+// No body needed — user accepting is the authenticated user
+
+// Logic:
+// 1. UPDATE tenants SET settings_json = jsonb_set(settings_json, '{mcp_terms_accepted}', 'true')
+//                      WHERE tenant_id = context.tenant_id
+// 2. Also set mcp_terms_accepted_at = now(), mcp_terms_accepted_by = context.user_id
+// 3. Return confirmation
+
+// Response 200: { accepted: true, accepted_at: string }
+// Response 409: { error: "Terms already accepted by this workspace" }
+```
+
+**Frontend gate:** Before showing the MCP "Add server" flow, the frontend calls `GET /tenants/me` (or checks workspace settings) to see if `settings_json.mcp_terms_accepted = true`. If false → show terms modal. Once accepted → never show again.
+
+---
+
+**EXCEED ELEVENLABS — Tools tab additions:**
+
+ElevenLabs tools are agent-scoped only. TRUSTNOW must add:
+
+1. **Workspace tool library:** Tools created for Agent A can be copied/reused in Agent B. Route: `GET /tools?scope=workspace` — shows all tools across all agents in the tenant. Agent admins can "clone to this agent" from the workspace library. Critical for BPO clients who maintain a standardised CRM tool across all agents.
+
+2. **Tool test runner (in-drawer):** A `Test` button inside the tool creation drawer sends a test HTTP request to the webhook URL with a sample payload, shows the response (status code + body + latency) without saving the tool. ElevenLabs requires saving before testing — TRUSTNOW tests before save. Route: `POST /tools/test` with the CreateToolDto payload + `{ test_payload: object }`.
+
+3. **Tool version history:** Track changes to tool configuration (URL, method, parameters) per tool, per agent. Show "Last modified by {user} on {date}" in the tool list. Route: `GET /tools/:id/history`. Critical for BPO audit trails — a change to a CRM tool URL could silently break production.
+
+4. **Partition-aware URL validation:** When the agent is on Partition B (on-prem), validate that webhook URLs resolve to private IP ranges only. Display a green ✓ badge ("Private endpoint") or red ✗ ("Public endpoint — not allowed on Partition B"). Prevents on-prem agents from accidentally calling external APIs.
+
+---
+
+### 6.2K — KnowledgeBaseModule Endpoint Contracts (CO-BROWSING §8)
+
+**Architectural note (§8.2 confirmed live):** KB documents are workspace-level assets. `knowledge_base_docs` has `tenant_id` only. Agent attachment is via `agent_knowledge_base` junction table. This is a key architectural distinction from the earlier assumption that KB docs were agent-scoped.
+
+---
+
+#### `POST /kb/documents` — Create KB Document (3 types)
+
+```typescript
+export class CreateKbDocumentDto {
+  // Required for all types
+  name: string;
+  type: 'url' | 'file' | 'text';
+
+  // type='url' — web crawl
+  source_url?: string;           // triggers async crawl job via BullMQ
+
+  // type='file' — handled by multipart upload (separate POST /kb/documents/upload)
+  // file is uploaded via POST /kb/documents/upload, returns a temp_file_id
+  temp_file_id?: string;         // from the upload endpoint
+
+  // type='text' — inline text
+  content?: string;
+
+  // Optional
+  visibility?: 'private' | 'workspace' | 'public';  // default 'workspace'
+}
+
+// Response 201
+{
+  kb_doc_id: string,
+  name: string,
+  type: string,
+  status: 'pending' | 'indexing',  // immediate status — indexing starts async
+  created_at: string
+}
+
+// After creation: async RAG indexing pipeline fires:
+//   text extraction → chunking → embedding → Qdrant upsert → status = 'ready'
+// On failure: status = 'failed', error stored
+// Real-time status pushed via WebSocket: { type: 'kb_indexing_update', kb_doc_id, status }
+```
+
+#### `POST /kb/documents/upload` — File Upload (pre-step for type='file')
+
+```typescript
+// Multipart POST — Content-Type: multipart/form-data
+// Accepted: PDF, DOCX, TXT, CSV, MD
+// Max size: 50MB per file
+
+// Response 200
+{
+  temp_file_id: string,   // pass this to POST /kb/documents as temp_file_id
+  filename: string,
+  size_bytes: number,
+  mime_type: string,
+  expires_at: string      // temp files auto-deleted after 1 hour if not committed
+}
+```
+
+#### `GET /kb/documents` — List Workspace KB Documents
+
+```typescript
+// GET /kb/documents?tenant_id=<from_context>&search=<query>&type=<filter>
+// Returns all KB docs for this tenant, regardless of which agents use them
+// Used by: "Add document" dropdown in Tab 4 (shows existing workspace docs for reuse)
+
+// Response 200: { docs: KbDocument[], total: number }
+// Each KbDocument includes: kb_doc_id, name, type, status, visibility,
+//   created_by, created_at, last_indexed_at, dependent_agent_count
+```
+
+#### `GET /kb/documents/:id` — KB Document Detail
+
+```typescript
+// Response 200
+{
+  kb_doc_id: string,
+  name: string,
+  type: string,
+  status: string,
+  visibility: string,
+  source_url?: string,
+  chunk_count: number,
+  last_indexed_at: string,
+  created_by: string,
+  // Dependent agents (§8.2 — confirmed live: shown in detail panel)
+  dependent_agents: Array<{ agent_id: string, agent_name: string }>,
+  dependent_branches: Array<{ agent_id: string, agent_name: string, branch_id: string, branch_name: string }>
+}
+```
+
+#### `POST /agents/:id/kb/attach` — Attach KB Doc to Agent
+
+```typescript
+export class AttachKbDocDto {
+  kb_doc_id: string;
+  branch_id?: string;  // null = attach to all branches
+}
+// Inserts into agent_knowledge_base junction table
+// Response 200: { attached: true, kb_doc_id, agent_id }
+```
+
+#### `DELETE /agents/:id/kb/:kb_doc_id` — Detach KB Doc from Agent
+
+```typescript
+// Removes from agent_knowledge_base junction table
+// Does NOT delete the kb_doc (it may be used by other agents)
+// Response 200: { detached: true }
+```
+
+#### `PUT /agents/:id/kb/rag-config` — Save RAG Configuration
+
+```typescript
+export class UpdateRagConfigDto {
+  rag_enabled?: boolean;
+  rag_embedding_model?: 'english' | 'multilingual';
+  rag_character_limit?: number;
+  rag_chunk_limit?: number;
+  rag_vector_distance_limit?: number;
+  rag_num_candidates_enabled?: boolean;
+  rag_num_candidates_value?: number;
+  rag_query_rewrite_enabled?: boolean;
+  rag_query_rewrite_prompt?: string;
+}
+// Updates agent_configs RAG fields for this agent
+// Response 200: { updated_at: string }
+```
+
+#### `POST /kb/documents/:id/reindex` — Trigger Re-indexing
+
+```typescript
+// Re-runs the RAG indexing pipeline for this KB doc
+// Used by "Re-index" action in KB item overflow menu
+// Response 202: { job_id: string, status: 'queued' }
+```
+
+---
+
+**EXCEED ELEVENLABS — KB tab additions:**
+
+1. **Dependent agents warning on KB edit:** When a KB document is modified (re-indexed, renamed, deleted), the platform warns: "This KB document is used by N agents: [agent list]. Modifying it will affect all of them." ElevenLabs shows dependent agents in the detail panel but has no action guard. TRUSTNOW blocks deletion if `dependent_agent_count > 0` unless the user confirms.
+
+2. **KB version snapshots:** When a KB doc is re-indexed, the previous version is snapped to a `kb_doc_versions` table. Agent admins can roll back to a previous KB version. Critical for BPO compliance: "What was the agent's KB saying on the date of this call?"
+
+3. **KB analytics:** Per-KB document: "Retrieved in N% of conversations this week" — from `agent_response_metadata` client events that include KB retrieval data. Shows which KB docs are actually being used in answers vs which are never retrieved.
+
+4. **Scheduled re-index:** For type='url' KB docs, allow setting a re-crawl schedule (daily/weekly). ElevenLabs requires manual re-indexing. TRUSTNOW automates it for clients whose knowledge base changes frequently.
+
+---
+
+### 6.2L — AnalysisModule Endpoint Contracts (CO-BROWSING §9)
+
+#### Evaluation Criteria CRUD
+
+```typescript
+// POST /agents/:id/criteria — add a new evaluation criterion
+export class CreateCriterionDto {
+  name: string;          // e.g. "Did the agent collect the caller's name?"
+  description?: string;
+  llm_prompt: string;    // e.g. "Given this transcript, did the agent collect the caller's full name? Answer YES or NO only."
+}
+// Response 201: { criteria_id, name, created_at }
+
+// GET /agents/:id/criteria — list all criteria for this agent
+// Response 200: Criterion[]
+
+// PUT /agents/:id/criteria/:criteria_id — update a criterion
+// DELETE /agents/:id/criteria/:criteria_id — delete a criterion
+// Response 200: { deleted: true }
+// Side effect: future conversations won't be evaluated against deleted criteria
+// Historic conversations retain their criteria_results (not retroactively re-evaluated)
+```
+
+#### Data Collection Specs CRUD
+
+```typescript
+// POST /agents/:id/data-specs — add a data extraction spec
+export class CreateDataSpecDto {
+  field_name: string;       // e.g. "customer_intent"
+  field_type?: 'string' | 'boolean' | 'number';  // default 'string'
+  extraction_prompt: string; // e.g. "Extract the customer's primary reason for calling"
+  is_required?: boolean;     // default false
+}
+// Response 201: { spec_id, field_name, created_at }
+
+// GET /agents/:id/data-specs
+// PUT /agents/:id/data-specs/:spec_id
+// DELETE /agents/:id/data-specs/:spec_id
+```
+
+#### Analysis Language
+
+```typescript
+// PUT /agents/:id/analysis-language
+export class UpdateAnalysisLanguageDto {
+  analysis_language: string;  // 'auto' or language code e.g. 'en', 'hi'
+}
+// Updates agents.analysis_language
+// Response 200: { analysis_language }
+```
+
+#### Conversations (Analysis Tab + Global Monitor — CO-BROWSING §9 + §15)
+
+```typescript
+// GET /conversations — workspace-level global conversation history (§15)
+// GET /conversations?agent_id=:id — agent-scoped (§9 Analysis tab)
+//
+// ALL QUERY FILTERS (confirmed live — 12 global + 1 agent-scoped):
+// ?agent_id=       UUID   — filter by specific agent (§15 "Agent" chip — NOT on Analysis tab)
+// ?branch_id=      UUID   — filter by branch (Analysis tab pre-applies this)
+// ?date_after=     ISO    — conversations starting after this datetime
+// ?date_before=    ISO    — conversations starting before this datetime
+// ?call_status=    'successful'|'failed'
+// ?criteria=       criteria_id — filter by evaluation criteria result
+// ?data=           field_name:value — filter by data collection value
+// ?duration_min=   number — minimum duration in seconds
+// ?duration_max=   number — maximum duration in seconds
+// ?rating_min=     number — minimum CSAT rating (1-5)
+// ?rating_max=     number — maximum CSAT rating (1-5)
+// ?has_comments=   boolean — has QM annotations
+// ?tools_used=     tool_id — filter conversations where this tool was invoked
+// ?language=       language code — detected conversation language
+// ?user_id=        string — caller user ID
+// ?channel=        'widget'|'phone'|'whatsapp'
+// ?search=         string — full-text search on transcript
+// ?sort=           'date_asc'|'date_desc' (default: date_desc)
+// ?page=           number (default: 1)
+// ?limit=          number (default: 20, max: 100)
+//
+// Response 200:
+{
+  conversations: Array<{
+    conversation_id: string,
+    agent_id: string,
+    agent_name: string,           // joined — shown in global view Agent column
+    branch_id: string | null,
+    branch_name: string | null,   // joined — shown as branch badge
+    channel: string,
+    started_at: string,
+    duration_s: number,
+    turn_count: number,
+    call_successful: boolean | null,
+    environment: string
+  }>,
+  total: number,
+  page: number,
+  limit: number,
+  has_more: boolean               // for infinite scroll "Loading..." pattern
+}
+
+// GET /conversations/:id — full detail (same for both views)
+// Returns: all conversations fields + ai_summary + evaluation_results +
+//          data_collection_results + client_data + applied_overrides
+
+// GET /conversations/:id/turns — per-turn latency data (Transcription sub-tab)
+// Returns: conversation_turns[] sorted by turn_index
+
+// GET /conversations/:id/share-link — generate shareable link (§15.4 ↗ icon)
+// Returns: { share_url: string, expires_at: string | null }
+// share_url format: https://app.trustnow.ai/conversations/{conversation_id}?token={share_token}
+// share_token: short-lived signed JWT (24h TTL) allowing unauthenticated read of this conversation
+// Used by supervisors sharing specific conversations with clients or QA teams
+```
+
+**Column settings (TT icon — §15.2):** The `TT` icon top-right of the search bar opens a column visibility toggle panel. Columns that can be shown/hidden: Agent | Branch | Duration | Messages | Status | Channel | Cost | Language. Per-user preference, stored in `user_preferences` JSONB on `users` table. No backend endpoint needed — frontend localStorage is acceptable for column preferences.
+
+---
+
+#### Post-Call Background Job Pipeline (§9.3–§9.4)
+
+All three post-call analysis jobs run **asynchronously** after `how_call_ended` is set. They are BullMQ jobs queued when the session ends.
+
+```typescript
+// Job 1: AI Summary Generation (§9.3.1)
+// Queue: 'post-call-summary'
+async function generateAiSummary(conversation_id: string) {
+  const turns = await db.query(
+    'SELECT speaker, text FROM conversation_turns WHERE conversation_id = $1 ORDER BY turn_index',
+    [conversation_id]
+  );
+  const transcript = turns.map(t => `${t.speaker}: ${t.text}`).join('\n');
+  const summary = await llm.complete({
+    model: 'claude-haiku',   // cheap + fast — summary doesn't need Sonnet
+    prompt: `Summarise this customer service conversation in 2-3 sentences. Be neutral and factual.\n\n${transcript}`,
+    max_tokens: 300
+  });
+  await db.query(
+    'UPDATE conversations SET ai_summary = $1 WHERE conversation_id = $2',
+    [summary, conversation_id]
+  );
+}
+
+// Job 2: Evaluation Criteria Scoring (§9.4)
+// Queue: 'post-call-criteria'
+async function evaluateCriteria(conversation_id: string, agent_id: string) {
+  const [criteria, transcript] = await Promise.all([
+    db.query('SELECT * FROM evaluation_criteria WHERE agent_id = $1', [agent_id]),
+    db.query('SELECT transcript_json FROM conversations WHERE conversation_id = $1', [conversation_id])
+  ]);
+  if (!criteria.length) return;  // no criteria configured — skip
+
+  const results: Record<string, boolean> = {};
+  for (const criterion of criteria) {
+    const response = await llm.complete({
+      model: 'claude-haiku',
+      prompt: `${criterion.llm_prompt}\n\nTranscript:\n${JSON.stringify(transcript.transcript_json)}\n\nAnswer YES or NO only.`,
+      max_tokens: 5
+    });
+    results[criterion.criteria_id] = response.trim().toUpperCase() === 'YES';
+  }
+  const all_pass = Object.values(results).every(v => v === true);
+  await db.query(
+    'UPDATE conversations SET evaluation_results = $1, call_successful = $2 WHERE conversation_id = $3',
+    [results, all_pass, conversation_id]
+  );
+}
+
+// Job 3: Data Extraction (§9.4)
+// Queue: 'post-call-data-extraction'
+async function extractDataPoints(conversation_id: string, agent_id: string) {
+  const [specs, transcript] = await Promise.all([
+    db.query('SELECT * FROM data_collection_specs WHERE agent_id = $1', [agent_id]),
+    db.query('SELECT transcript_json FROM conversations WHERE conversation_id = $1', [conversation_id])
+  ]);
+  if (!specs.length) return;
+
+  const extracted: Record<string, unknown> = {};
+  for (const spec of specs) {
+    const response = await llm.complete({
+      model: 'claude-haiku',
+      prompt: `${spec.extraction_prompt}\n\nTranscript:\n${JSON.stringify(transcript.transcript_json)}\n\nExtract the value only. If not found, return "NOT_FOUND".`,
+      max_tokens: 100
+    });
+    extracted[spec.field_name] = response.trim() === 'NOT_FOUND' ? null : response.trim();
+  }
+  await db.query(
+    'UPDATE conversations SET data_collection_results = $1 WHERE conversation_id = $2',
+    [extracted, conversation_id]
+  );
+}
+```
+
+**EXCEED ELEVENLABS — Analysis tab additions:**
+
+1. **QM Supervisor Review Workflow:** ElevenLabs has evaluation criteria (pass/fail) but no supervisor workflow. TRUSTNOW adds: when `call_successful = false`, flag conversation for supervisor review. Supervisor sees a "Needs Review" badge in the conversation list. Supervisor can add a manual QM score (1-5), annotate turns with the bell icon 🔔, and mark as "Reviewed". Maps to new `qm_reviews` table: `(review_id, conversation_id, supervisor_id, score, notes, reviewed_at)`.
+
+2. **Agent coaching flags:** When a conversation fails evaluation criteria, the system auto-generates a coaching note for the agent: "In this conversation, [criterion X] was not met. Consider [recommendation]." BPO supervisors can then share the coaching note with the agent team. ElevenLabs has no coaching workflow at all.
+
+3. **Cost trending charts:** Alongside per-call cost (credits + USD), show a weekly cost trend sparkline in the Analysis tab header — "This week: $X.XX (+N% vs last week)". BPO operations teams manage per-agent cost budgets and need this at-a-glance.
+
+4. **Batch re-evaluation:** When evaluation criteria are added or changed, TRUSTNOW allows retroactive re-evaluation of past conversations. "Re-evaluate last 100 conversations" button — queues 100 `post-call-criteria` jobs. ElevenLabs has no retroactive re-evaluation.
+
+---
+
+### 6.2M — PhoneNumbersModule Endpoint Contracts (CO-BROWSING §10)
+
+**Module context:** The Phone Numbers sidebar (Deploy → Phone Numbers) manages SIP trunk assignments. FreeSWITCH (Task 7) handles the actual SIP signalling — this module only manages the configuration database and the TRUSTNOW SIP endpoint details.
+
+**TRUSTNOW SIP endpoint (equivalent of ElevenLabs `sip.rtc.elevenlabs.io`):**
+```
+sip:sip.rtc.trustnow.ai:5060;transport=tcp   (standard)
+sip:sip.rtc.trustnow.ai:5061;transport=tls   (encrypted — recommended)
+```
+Full call URI: `sip:+19991234567@sip.rtc.trustnow.ai:5060`
+
+---
+
+#### `GET /phone-numbers` — List all phone numbers for tenant
+
+```typescript
+// Response 200
+{
+  phone_numbers: Array<{
+    phone_number_id: string,
+    label: string,
+    phone_number: string,        // E.164
+    agent_id: string | null,
+    agent_name: string | null,   // joined from agents table
+    status: 'active' | 'paused' | 'archived',
+    sip_transport: 'tcp' | 'tls',
+    media_encryption: 'disabled' | 'allowed' | 'required'
+  }>
+}
+```
+
+#### `POST /phone-numbers` — Import a phone number from SIP trunk (8-step wizard submit)
+
+```typescript
+export class CreatePhoneNumberDto {
+  // Step 2 — Basic config
+  label: string;
+  phone_number: string;           // E.164 — validated with regex /^\+[1-9]\d{6,14}$/
+
+  // Step 3 — Inbound transport + encryption
+  sip_transport: 'tcp' | 'tls';                           // default 'tls'
+  media_encryption: 'disabled' | 'allowed' | 'required';  // default 'required'
+
+  // Step 4 — Outbound settings
+  outbound_address?: string;        // SIP provider hostname — no sip: prefix
+  outbound_transport?: 'tcp' | 'tls';
+  outbound_encryption?: 'disabled' | 'allowed' | 'required';
+
+  // Step 5 — Custom SIP headers
+  custom_sip_headers?: Array<{ name: string; value: string }>;
+
+  // Step 6 — Authentication (mutual exclusive: digest OR ACL)
+  sip_username?: string;            // Digest auth — if provided, sip_password required
+  sip_password?: string;            // Stored encrypted; never returned in GET responses
+
+  // Post-wizard — agent assignment (can be set later)
+  agent_id?: string;
+}
+
+// Logic:
+// 1. Validate phone_number is valid E.164
+// 2. Validate unique within tenant
+// 3. Encrypt sip_password using Vault KV secret (path: trustnow/{tenant_id}/sip/{phone_number_id})
+// 4. Insert phone_numbers row
+// 5. If agent_id provided: verify agent belongs to tenant
+// 6. Trigger FreeSWITCH dialplan reload via ESL: `api reloadxml` (adds new DID route)
+// Response 201: { phone_number_id, phone_number, label, status: 'active' }
+```
+
+#### `PUT /phone-numbers/:id` — Update phone number config
+
+```typescript
+// Same fields as CreatePhoneNumberDto — all optional (partial update)
+// On sip_password change: re-encrypt and update Vault secret
+// On agent_id change: reload FreeSWITCH dialplan
+// Response 200: { updated_at }
+```
+
+#### `PUT /phone-numbers/:id/assign` — Assign agent to number
+
+```typescript
+export class AssignAgentDto {
+  agent_id: string | null;   // null = unassign
+}
+// Updates phone_numbers.agent_id
+// Triggers FreeSWITCH dialplan reload: routes calls to this DID to the assigned agent
+// Triggers agent_configs audio format auto-set to ulaw_8000 (§6.2H)
+// Response 200: { agent_id, agent_name }
+```
+
+#### `DELETE /phone-numbers/:id` — Remove phone number
+
+```typescript
+// Soft-delete: SET status = 'archived' (not hard delete — audit trail)
+// Removes DID from FreeSWITCH dialplan via ESL reload
+// Response 200: { archived: true }
+```
+
+#### `GET /phone-numbers/sip-endpoint` — Return TRUSTNOW SIP endpoint details for display in UI
+
+```typescript
+// No auth required beyond tenant membership
+// Returns the SIP endpoint details shown in the Phone Numbers setup guide
+
+// Response 200
+{
+  sip_endpoint: {
+    standard: 'sip:sip.rtc.trustnow.ai:5060;transport=tcp',
+    tls: 'sip:sip.rtc.trustnow.ai:5061;transport=tls',
+    static_ip: {                         // Enterprise only — check tenant.plan_tier
+      us: 'sip-static.rtc.trustnow.ai',
+      eu: 'sip-static.rtc.eu.trustnow.ai',
+      in: 'sip-static.rtc.in.trustnow.ai'
+    }
+  },
+  supported_codecs: ['G711/8kHz (PCMU)', 'G722/16kHz'],
+  transport_protocols: ['TCP', 'TLS'],
+  udp_supported: false,
+  rtp_port_range: '10000-60000',
+  tls_minimum: 'TLS 1.2'
+}
+```
+
+---
+
+**EXCEED ELEVENLABS — Phone Numbers additions:**
+
+ElevenLabs provides one shared SIP endpoint globally. TRUSTNOW must exceed this for BPO:
+
+1. **Geographic SIP endpoints:** Three regional SIP endpoints — US (`sip.rtc.trustnow.ai`), EU (`sip.rtc.eu.trustnow.ai`), India (`sip.rtc.in.trustnow.ai`). BPO clients route UK/EU calls to the EU endpoint for GDPR data residency. India endpoint serves Exotel and Tata/BSNL SIP trunks.
+
+2. **SIP trunk test call:** A `Test connection` button in the Phone Numbers setup wizard sends a test SIP INVITE to the configured outbound address and reports: 200 OK (success), 503 (unreachable), or timeout. ElevenLabs requires placing a real call to verify — TRUSTNOW tests before going live.
+
+3. **Call routing rules per number:** Beyond "one number → one agent", TRUSTNOW supports routing rules per DID: time-of-day routing (business hours → Agent A, after-hours → Agent B), DNIS-based routing, caller ID-based routing (VIP callers → priority queue). These are BPO-standard requirements.
+
+4. **Concurrent call capacity indicator:** Each phone number row shows current concurrent call count and a capacity meter. When approaching FreeSWITCH channel limit, show amber warning: "Approaching capacity — N/M concurrent calls". Critical for BPO operations teams managing SLA.
+
+---
+
+### 6.2N — BatchCallModule Endpoint Contracts (CO-BROWSING §11)
+
+---
+
+#### `GET /batch-calls` — List batch calls for tenant
+
+```typescript
+// Response 200
+{
+  batch_calls: Array<{
+    batch_call_id: string,
+    name: string,
+    status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed',
+    total_recipients: number,
+    calls_completed: number,
+    calls_failed: number,
+    calls_pending: number,
+    scheduled_at: string | null,
+    started_at: string | null,
+    created_at: string
+  }>
+}
+```
+
+#### `POST /batch-calls` — Create a batch call
+
+```typescript
+export class CreateBatchCallDto {
+  name?: string;                  // default 'Untitled Batch'
+  agent_id: string;
+  phone_number_id: string;        // must belong to this tenant
+  ringing_timeout_s?: number;     // default 60
+  concurrency_limit?: number;     // null = auto
+  scheduled_at?: string;          // ISO datetime — null = run immediately
+  timezone?: string;              // e.g. 'Asia/Calcutta'
+  compliance_acknowledged: boolean;  // MUST be true — blocked otherwise
+  // recipients supplied via multipart form-data: recipients_file (CSV/XLS)
+}
+
+// Logic:
+// 1. Validate compliance_acknowledged === true — HTTP 422 if false
+// 2. Validate agent_id + phone_number_id belong to tenant
+// 3. Parse CSV/XLS file:
+//    a. Validate 'phone_number' column exists — HTTP 422 if missing
+//    b. Extract special columns: language, first_message, system_prompt, voice_id → overrides JSONB
+//    c. Remaining columns → dynamic_variables JSONB
+//    d. Validate all phone_numbers are E.164 format
+//    e. Deduplicate phone numbers within batch
+// 4. Calculate effective concurrency:
+//    if concurrency_limit IS NULL:
+//      effective = MIN(workspace_concurrency_limit × 0.5, agent_concurrency_limit × 0.7)
+//    else:
+//      effective = concurrency_limit
+// 5. Insert batch_calls row + bulk insert batch_call_recipients
+// 6. If scheduled_at is null: enqueue BatchCallWorker job immediately
+//    If scheduled_at is set: schedule job via BullMQ delayed queue
+// Response 201: { batch_call_id, name, status: 'pending', total_recipients }
+```
+
+#### `GET /batch-calls/:id` — Batch call detail + progress
+
+```typescript
+// Response 200: full batch_calls row + progress percentages
+{
+  batch_call_id: string,
+  name: string,
+  status: string,
+  agent_id: string,
+  agent_name: string,
+  phone_number: string,
+  total_recipients: number,
+  calls_completed: number,
+  calls_failed: number,
+  calls_pending: number,
+  progress_pct: number,          // (completed + failed) / total × 100
+  scheduled_at: string | null,
+  started_at: string | null,
+  completed_at: string | null,
+  concurrency_limit: number | null,
+  effective_concurrency: number  // resolved auto value
+}
+```
+
+#### `GET /batch-calls/:id/recipients` — List recipients with call status
+
+```typescript
+// Supports pagination: ?page=1&limit=100
+// Response 200: { recipients: BatchCallRecipient[], total, page, limit }
+// Each recipient: phone_number, dynamic_variables, overrides, status, conversation_id
+// conversation_id allows linking to full conversation detail (Analysis tab)
+```
+
+#### `POST /batch-calls/:id/cancel` — Cancel a pending or running batch
+
+```typescript
+// Only cancellable when status = 'pending' or 'running'
+// Logic:
+// 1. SET batch_calls.status = 'cancelled'
+// 2. SET batch_call_recipients.status = 'cancelled' WHERE status = 'pending'
+// 3. If running: signal BullMQ worker to stop after current call (graceful stop)
+// 4. In-progress calls complete naturally — not dropped mid-call
+// Response 200: { cancelled: true, calls_cancelled: number }
+```
+
+#### `POST /batch-calls/test-call` — Single test call before submitting batch
+
+```typescript
+export class TestCallDto {
+  agent_id: string,
+  phone_number_id: string,
+  recipient_phone_number: string,  // E.164 — the test recipient's number
+  dynamic_variables?: Record<string, string>  // optional — test with sample variables
+}
+// Initiates a single real outbound call to verify the setup before the full batch
+// Response 202: { test_call_id: string }  — monitor via conversation record
+```
+
+---
+
+#### BatchCallWorker (BullMQ Worker)
+
+The core execution engine — runs as a separate NestJS worker process.
+
+```typescript
+// Queue: 'batch-calls'
+// Each job processes ONE batch_call_id
+
+@Processor('batch-calls')
+class BatchCallWorker {
+  async process(job: Job<{ batch_call_id: string }>) {
+    const batch = await this.db.getBatchCall(job.data.batch_call_id);
+
+    // Effective concurrency
+    const limit = batch.concurrency_limit ??
+      Math.min(
+        workspace.concurrency_limit * 0.5,
+        agent.concurrency_limit * 0.7
+      );
+
+    // Process recipients in waves of `limit` concurrent calls
+    const pending = await this.db.getPendingRecipients(batch.batch_call_id);
+    for (const chunk of chunks(pending, limit)) {
+      await Promise.all(chunk.map(r => this.makeOutboundCall(batch, r)));
+    }
+  }
+
+  async makeOutboundCall(batch, recipient) {
+    // 1. Build call config: merge agent config + overrides from recipient
+    // 2. Inject dynamic_variables into agent context
+    // 3. Initiate SIP INVITE via FreeSWITCH ESL:
+    //    originate {origination_uuid=X,sip_h_X-TRUSTNOW-BATCH=batch_id}
+    //      sofia/gateway/trustnow_trunk/+15551234567
+    //      &bridge(trustnow_agent)
+    // 4. On answer: AI pipeline starts (STT → LLM → TTS) with dynamic_variables injected
+    // 5. On hang-up: UPDATE batch_call_recipients SET status = 'completed', conversation_id = ...
+    //               UPDATE batch_calls SET calls_completed += 1 (atomic counter)
+    // 6. On no-answer/error: status = 'failed', calls_failed += 1
+  }
+}
+```
+
+---
+
+**CSV Processing Pipeline (§11.8 confirmed):**
+
+```typescript
+// Steps executed synchronously before batch is committed:
+// 1. Upload CSV to MinIO: batch-uploads/{tenant_id}/{batch_call_id}.csv
+// 2. Parse with PapaParse (Node.js):
+//    - Validate 'phone_number' column present
+//    - Validate all phone_numbers match /^\+[1-9]\d{6,14}$/
+//    - Extract special columns: language|first_message|system_prompt|voice_id → overrides
+//    - All other columns → dynamic_variables
+// 3. Deduplicate on phone_number within batch
+// 4. Bulk INSERT batch_call_recipients (single transaction)
+// 5. UPDATE batch_calls.total_recipients = row_count
+```
+
+---
+
+**EXCEED ELEVENLABS — Batch Calling additions:**
+
+ElevenLabs batch calling is basic: upload CSV → send. TRUSTNOW adds:
+
+1. **DNC (Do Not Call) list enforcement:** Before queuing any recipient, check their phone number against a `dnc_numbers` table per tenant. Numbers on the DNC list are automatically excluded with status `dnc_excluded`. BPO compliance teams manage the DNC list (add numbers, bulk import from CSV, auto-expire after N days). ElevenLabs has no DNC checking.
+
+2. **Calling hours enforcement:** Per-batch configuration of permitted calling hours by timezone (e.g., 9am–8pm Mon-Fri in recipient's timezone). Recipients scheduled outside permitted hours are queued to the next valid window. Maps to `batch_calls.allowed_hours_json`. TRAI/TCPA compliance requirement.
+
+3. **Retry logic:** For `failed` (no answer) recipients, configure automatic retry: up to 3 attempts, minimum 2 hours between retries. `batch_call_recipients.retry_count INTEGER DEFAULT 0` + `next_retry_at TIMESTAMPTZ`. ElevenLabs marks no-answer as permanently failed.
+
+4. **Per-batch cost estimate:** Before submitting, show: "Estimated cost: £X.XX (based on avg call duration of Xm Xs at £X.XX/min per call × N recipients)." Helps BPO clients budget campaigns before committing.
+
+5. **Batch pause/resume:** `POST /batch-calls/:id/pause` stops sending new calls while in-progress calls finish. `POST /batch-calls/:id/resume` continues from where it stopped. Useful for mid-campaign compliance checks.
+
+---
+
+### 6.2O — WorkflowModule Endpoint Contracts (CO-BROWSING §12)
+
+**Architecture note:** Workflow definitions are stored in `workflow_nodes` + `workflow_edges` tables, not in `agent_configs.workflow_definition_json` JSONB. The JSONB approach was abandoned — querying conditions, KB attachments per node, and validation all require relational structure.
+
+---
+
+#### `GET /agents/:id/workflow` — Load full workflow for canvas rendering
+
+```typescript
+// Response 200 — full workflow graph for the canvas
+{
+  nodes: Array<{
+    node_id: string,
+    node_type: 'start' | 'subagent' | 'say' | 'agent_transfer' | 'phone_transfer' | 'tool' | 'end',
+    label: string,
+    position_x: number,
+    position_y: number,
+    // Subagent fields
+    conversation_goal?: string,
+    override_prompt?: boolean,
+    voice_id?: string | null,
+    llm_model?: string | null,
+    eagerness?: string | null,
+    spelling_patience?: string | null,
+    speculative_turn_enabled?: boolean | null,
+    config?: object      // type-specific fields
+  }>,
+  edges: Array<{
+    edge_id: string,
+    source_node_id: string,
+    target_node_id: string,
+    condition_label: string,
+    condition_type: 'unconditional' | 'llm_evaluated' | 'tool_output',
+    priority: number
+  }>,
+  global_settings: {
+    prevent_infinite_loops: boolean
+  },
+  validation_errors: Array<{
+    node_id: string,
+    message: string   // e.g. "Agent ID cannot be empty"
+  }>
+}
+```
+
+#### `PUT /agents/:id/workflow` — Save full workflow (complete replace)
+
+```typescript
+export class SaveWorkflowDto {
+  nodes: CreateWorkflowNodeDto[];
+  edges: CreateWorkflowEdgeDto[];
+  global_settings?: {
+    prevent_infinite_loops?: boolean;
+  };
+}
+
+export class CreateWorkflowNodeDto {
+  node_id?: string;         // omit for new nodes — backend generates UUID
+  node_type: string;
+  label?: string;
+  position_x: number;
+  position_y: number;
+  // Subagent fields (all optional — null = use agent default)
+  conversation_goal?: string;
+  override_prompt?: boolean;
+  voice_id?: string | null;
+  llm_model?: string | null;
+  eagerness?: string | null;
+  spelling_patience?: string | null;
+  speculative_turn_enabled?: boolean | null;
+  config?: object;
+}
+
+export class CreateWorkflowEdgeDto {
+  edge_id?: string;
+  source_node_id: string;
+  target_node_id: string;
+  condition_label?: string;
+  condition_type?: 'unconditional' | 'llm_evaluated' | 'tool_output';
+  priority?: number;
+}
+
+// Logic:
+// 1. DELETE all workflow_nodes + workflow_edges for agent_id + branch_id
+// 2. INSERT new nodes (with new UUIDs for any without node_id)
+// 3. INSERT new edges (resolving node_ids)
+// 4. Run validation — check for: orphaned nodes, missing agent IDs on transfers, loops
+// 5. Return { saved: true, validation_errors: [] }
+
+// Response 200: { saved: true, validation_errors: [] }
+// Response 422: { error: 'Workflow save failed', validation_errors: [...] }
+```
+
+**Auto-save behaviour:** The frontend debounces workflow saves by 2 seconds after the last canvas change. Does NOT require explicit "Save" click — behaves like a document editor.
+
+#### `GET /agents/:id/workflow/templates` — List workflow templates
+
+```typescript
+// Returns the 4 pre-built templates (confirmed §12.3):
+// 'qualification_flow' | 'authentication_flow' | 'enterprise_tier_escalation' | 'business_hours_router'
+// Each template includes a full nodes + edges definition ready to load into canvas
+
+// Response 200: { templates: WorkflowTemplate[] }
+// Each: { template_id, name, description, icon, nodes, edges }
+```
+
+#### `POST /agents/:id/workflow/load-template` — Apply a template to the canvas
+
+```typescript
+export class LoadWorkflowTemplateDto {
+  template_id: string;  // one of the 4 template IDs
+}
+// Replaces current workflow with template nodes/edges
+// Response 200: same shape as GET /agents/:id/workflow
+```
+
+---
+
+**Workflow Template Seed Data (Task 6 — required before UI build):**
+
+Seed 4 workflow templates matching the ElevenLabs templates exactly (confirmed §12.3). Store in a `workflow_templates` table: `(template_id, name, description, icon, nodes_json, edges_json)`.
+
+| Template | BPO Equivalent | Seed priority |
+|----------|---------------|---------------|
+| Qualification Flow | Standard inbound routing (qualify → skill route) | P0 |
+| Authentication Flow | Caller verification before sensitive actions | P0 |
+| Enterprise Tier Escalation | Tiered SLA routing (enterprise vs standard) | P0 |
+| Business Hours Router | IVR hours routing → human agent out-of-hours | P0 |
+
+All 4 are P0 — they are the core BPO contact centre patterns.
+
+---
+
+**EXCEED ELEVENLABS — Workflow tab additions:**
+
+ElevenLabs workflow is functional but generic. TRUSTNOW adds BPO-specific capability:
+
+1. **BPO workflow template library:** Expand beyond the 4 base templates with 10+ BPO-specific templates: Debt Collection Flow (identify → verify → negotiate payment arrangement → confirm), Insurance FNOL Flow (capture incident → triage → assign handler → send confirmation), Appointment Reminder Flow (confirm → reschedule → cancel options). These are the workflows BPO clients need on day 1.
+
+2. **Workflow validation badge:** The agent page header shows an `Errors` badge (red) when the workflow has validation issues (e.g., disconnected nodes, empty agent transfer). TRUSTNOW makes this actionable: clicking the badge opens a panel listing all validation errors with jump-to-node links. ElevenLabs shows the badge but not a structured error list.
+
+3. **Node performance metrics:** Each Subagent node shows a mini-chart on hover: avg duration at this step (Xs), % of conversations that reach this node, % that exit via each edge. This lets BPO designers see where callers drop off and optimise the flow. ElevenLabs has no per-node analytics.
+
+4. **Workflow version history:** Each time a workflow is saved, snapshot the nodes/edges JSON to a `workflow_versions` table. Show "Last changed by {user} on {date}" above the canvas. "Restore this version" available for up to 30 days. Critical for BPO clients who iterate workflows and need to roll back when a change breaks conversion rates.
+
+---
+
+### 6.2P — BranchesModule Endpoint Contracts (CO-BROWSING §13)
+
+**Traffic routing invariant:** All `live` branches for an agent must sum to exactly 100% traffic. Enforce this constraint at the database level with a partial `CHECK` or application-level validation. A branch with `traffic_split = 0` can be live (receives 0% traffic — useful for a "shadow" branch collecting analytics without serving real callers).
+
+---
+
+#### `GET /agents/:id/branches` — List all branches
+
+```typescript
+// Response 200
+{
+  branches: Array<{
+    branch_id: string,
+    name: string,
+    description: string | null,
+    traffic_split: number,     // 0-100
+    status: 'draft' | 'live' | 'paused' | 'archived',
+    is_protected: boolean,
+    parent_branch_id: string | null,
+    created_by: string,         // user email/name
+    created_at: string,
+    updated_at: string,
+    latest_version_number: number | null
+  }>
+}
+```
+
+#### `POST /agents/:id/branches` — Create a new branch
+
+```typescript
+export class CreateBranchDto {
+  name: string;            // required — max 100 chars
+  description?: string;
+  // New branch is always cloned from the current active (Live) branch config
+  // Starts with traffic_split = 0, status = 'draft'
+}
+
+// Logic:
+// 1. Clone full agent_configs snapshot from current live branch
+// 2. INSERT agent_branches row: { name, description, traffic_split: 0, status: 'draft', parent_branch_id: source_branch_id }
+// 3. Clone workflow_nodes + workflow_edges for new branch_id
+// 4. Clone agent_knowledge_base attachments for new branch_id
+// Response 201: { branch_id, name, status: 'draft', traffic_split: 0 }
+```
+
+#### `PUT /agents/:id/branches/:branch_id` — Update branch metadata
+
+```typescript
+export class UpdateBranchDto {
+  name?: string;
+  description?: string;
+}
+// Only updates metadata — not config (config is edited via all other tabs while branchId is active)
+// Response 200: { updated_at }
+```
+
+#### `PUT /agents/:id/branches/:branch_id/traffic` — Set traffic split
+
+```typescript
+export class UpdateBranchTrafficDto {
+  traffic_split: number;    // 0.00–100.00
+  status?: 'live' | 'paused';
+}
+
+// Validation:
+// 1. If setting status = 'live': check sum of all live branches ≤ 100%
+//    If would exceed 100%: HTTP 422 "Traffic split would exceed 100%"
+// 2. If setting to 0%: allowed — branch receives no traffic but remains 'live'
+// Response 200: { traffic_split, status }
+```
+
+**Traffic routing algorithm (§13.7 confirmed):**
+```
+rand = random(0, 100)
+cumulative = 0
+for branch in sorted_live_branches_by_id:
+  cumulative += branch.traffic_split
+  if rand < cumulative:
+    return branch.branch_id
+```
+
+#### `POST /agents/:id/branches/:branch_id/protect` — Enable branch protection
+
+```typescript
+// Sets is_protected = true — subsequent edits to this branch require a prior
+// POST /agents/:id/branches/:branch_id/unlock call
+// Response 200: { is_protected: true }
+```
+
+#### `POST /agents/:id/branches/:branch_id/unlock` — Unlock a protected branch
+
+```typescript
+// Sets is_protected = false — allows editing until re-protected
+// Audit log entry created: { action: 'branch_unlocked', branch_id, user_id }
+// Response 200: { is_protected: false }
+```
+
+#### `GET /agents/:id/branches/:branch_id/versions` — Version history (clock icon)
+
+```typescript
+// Response 200
+{
+  versions: Array<{
+    version_id: string,
+    version_number: number,
+    published_by: string,    // user name/email
+    published_at: string,
+    notes: string | null
+  }>
+}
+```
+
+#### `POST /agents/:id/branches/:branch_id/versions/:version_id/restore` — Roll back to a version
+
+```typescript
+// Restores agent_configs to the snapshot stored in branch_versions.snapshot
+// Creates a new branch_version entry with notes: "Restored from v{N}"
+// Response 200: { restored: true, new_version_number: N+1 }
+```
+
+#### `DELETE /agents/:id/branches/:branch_id` — Archive a branch
+
+```typescript
+// Soft delete: SET status = 'archived'
+// Cannot archive the last live branch (would leave agent with no traffic)
+// Cannot archive a protected branch (must unlock first)
+// Response 200: { archived: true }
+```
+
+---
+
+**EXCEED ELEVENLABS — Branches additions:**
+
+ElevenLabs branches support A/B traffic splits. TRUSTNOW adds:
+
+1. **Language variant branches:** First-class support for language-specific branches. When creating a branch, option to tag it as a `language_variant` with a language code (e.g. `hi` for Hindi). The traffic router preferentially routes callers whose `Accept-Language` or detected language matches the branch tag. E.g. Main = English (70%), Hindi branch = Hindi (30%). BPO clients in India need this for multilingual deployments without separate agents.
+
+2. **Canary deployment flow:** When a new branch is created and set to 5% traffic, show a guided UI: "Monitor for 24h → Auto-promote to 50% if success rate ≥ previous branch → Auto-promote to 100% after another 24h." BPO operators don't need to manually adjust traffic splits during a canary rollout.
+
+3. **Branch comparison view:** Side-by-side analytics for two branches: calls / avg duration / success rate / cost per call. Click "Declare winner" → auto-sets the winning branch to 100% and archives the loser. ElevenLabs has no built-in branch comparison or winner declaration.
+
+4. **Branch change log:** Each branch row shows a "N changes" chip (e.g. "3 changes since last publish"). Clicking opens a diff view: what changed in system prompt, tools, KB, voice since the last published version. BPO compliance teams need an audit trail of exactly what changed before any live deployment.
+
+---
+
+### 6.2Q — TestsModule Endpoint Contracts (CO-BROWSING §14)
+
+**Two access levels (§14.1):**
+- `/tests` — workspace-level test library (Monitor → Tests sidebar)
+- `/agents/:id/tests` — agent-scoped attachment and run management (Tab 7)
+
+---
+
+#### Workspace Tests CRUD
+
+```typescript
+// GET /tests — list all workspace tests
+// Query params: ?type=next_reply|tool_invocation|simulation&folder_id=&search=
+// Response 200: { tests: AgentTest[], total: number }
+
+// POST /tests — create a new test
+export class CreateTestDto {
+  name: string;
+  test_type: 'next_reply' | 'tool_invocation' | 'simulation';
+  folder_id?: string;
+  agent_id?: string;              // if provided + attach_to_agent=true: creates attachment
+  attach_to_agent?: boolean;      // default true when created from inside agent Tests tab
+
+  // Next Reply
+  conversation?: Array<{ role: 'user' | 'agent'; content: string }>;
+  expected_criteria?: string;
+  success_examples?: string[];
+  failure_examples?: string[];
+
+  // Tool Invocation
+  tool_type?: 'workflow_transition' | 'tool_call';
+  target_agent_id?: string;
+  target_node_id?: string;
+  should_invoke?: boolean;
+
+  // Simulation
+  user_scenario?: string;
+  success_criteria?: string;
+  max_turns?: number;             // default 5
+  mock_all_tools?: boolean;
+
+  // Shared
+  dynamic_variables?: Record<string, string>;
+}
+// Response 201: { test_id, name, test_type }
+
+// GET /tests/:id — get full test detail
+// PUT /tests/:id — update test
+// DELETE /tests/:id — delete test + all attachments
+```
+
+#### Agent Test Attachments (Tab 7)
+
+```typescript
+// GET /agents/:id/tests — list tests attached to this agent
+// Response 200: { tests: AgentTest[], past_runs: TestRun[] }
+// past_runs = most recent 10 runs across all attached tests
+
+// POST /agents/:id/tests/attach
+export class AttachTestDto {
+  test_id: string;    // attach existing workspace test
+}
+// Inserts into agent_test_attachments
+// Response 200: { attached: true }
+
+// DELETE /agents/:id/tests/:test_id — detach (does not delete the test)
+// Response 200: { detached: true }
+```
+
+#### Test Execution
+
+```typescript
+// POST /tests/:id/run — run a test against an agent
+export class RunTestDto {
+  agent_id: string;
+  branch_id?: string;   // default: current live branch
+}
+
+// Logic by test_type:
+// 'next_reply':
+//   1. Build conversation from test.conversation[] as LLM history
+//   2. Call agent LLM with conversation + agent system prompt
+//   3. Get agent's actual next response
+//   4. Call evaluation LLM (Claude Haiku) with:
+//      prompt = "Given this expected criteria: {expected_criteria}\n
+//                Success examples: {success_examples}\n
+//                Failure examples: {failure_examples}\n
+//                Actual response: {actual_response}\n
+//                Did the actual response pass? Answer PASS or FAIL only."
+//   5. status = PASS or FAIL based on eval response
+
+// 'tool_invocation':
+//   1. Run agent with test conversation
+//   2. Check if target tool/node was invoked: binary check
+//   3. status = (tool_was_invoked === should_invoke) ? PASS : FAIL
+
+// 'simulation':
+//   1. Spawn simulated user LLM (Claude Haiku) with user_scenario as persona
+//   2. Run multi-turn conversation: simulated user ↔ agent (up to max_turns)
+//   3. Evaluate full transcript against success_criteria
+//   4. status = PASS or FAIL
+
+// Response 202: { run_id }  — async, poll GET /test-runs/:run_id for status
+
+// GET /test-runs/:run_id — check run status + results
+// Response 200: { run_id, status, result_detail, duration_ms }
+```
+
+#### Test Templates
+
+```typescript
+// GET /tests/templates — list the 5 seed templates
+// Response 200: { templates: AgentTest[] }
+// Returns the workspace templates (is_template=true) for the "Add test" dropdown
+
+// POST /tests/templates/:id/clone — clone a template into workspace
+// Creates a new agent_tests row with is_template=false, inheriting all template fields
+// Response 201: { test_id }
+```
+
+#### Test Folders
+
+```typescript
+// POST /test-folders — create a folder
+export class CreateTestFolderDto { name: string }
+// Response 201: { folder_id, name }
+
+// PUT /test-folders/:id — rename
+// DELETE /test-folders/:id — delete (moves contents to root)
+```
+
+---
+
+**Test Template Seed Data (Task 6):**
+
+Seed 5 templates matching the ElevenLabs defaults (§14.3). Set `is_template = true`, `created_by = system`. These appear in every tenant's "Add test" dropdown.
+
+| # | Name | Type | Key conversation |
+|---|------|------|-----------------|
+| 1 | Can read knowledge base | next_reply | User: "What cities does [airline] fly to from New York?" |
+| 2 | Empathy for Delayed Flight Test | next_reply | User: "My flight is delayed by 3 hours, I'm really frustrated" |
+| 3 | Greeting Response Test | next_reply | User: (empty — test agent's opening greeting) |
+| 4 | Workflow Node Transition Test | tool_invocation | User: "I need to pay my outstanding balance" → should_invoke Billing node |
+| 5 | Multi-Turn Lost Baggage Conversation Test | next_reply | Multi-turn: lost luggage scenario |
+
+---
+
+**EXCEED ELEVENLABS — Tests tab additions:**
+
+ElevenLabs tests are manual and run on-demand. TRUSTNOW adds:
+
+1. **Automated regression test suite on every Publish:** When an agent is published (Publish button), automatically run all attached tests as a pre-deployment gate. If any test fails → block publish with: "3 tests failed. Fix issues or override to force publish." ElevenLabs requires manual test execution. TRUSTNOW makes testing mandatory as a quality gate.
+
+2. **Test suites (folders as test suites):** Folders in the test library double as runnable test suites. "Run all tests in this folder" executes all tests against the agent in parallel. Shows aggregate pass rate: "9 / 10 tests passed". Essential for BPO clients with 50+ test cases per agent.
+
+3. **"Create test from this conversation" shortcut:** In the Analysis tab Transcription sub-tab, a "Create test from this conversation" button appears below each conversation. Pre-fills the Next Reply test form with the actual conversation as context. BPO QA teams identify failing real conversations and instantly convert them to regression tests — ElevenLabs only suggests this with an info banner, doesn't automate it.
+
+4. **Scheduled test runs:** Configure a test suite to run on a schedule (daily at 09:00). Sends Slack/email notification if any tests fail overnight. BPO clients with 24/7 agents need automated overnight quality monitoring.
+
+---
+
+### 6.2R — WhatsAppModule Endpoint Contracts (CO-BROWSING §16)
+
+**Meta platform prerequisites (§16.1):**
+- TRUSTNOW must register as a WhatsApp Business Solution Provider (BSP) with Meta, OR implement Meta Embedded Signup (Facebook OAuth) so clients authorise TRUSTNOW to manage their WhatsApp Business Accounts
+- Each connected WhatsApp account gets a `meta_waba_id` + `phone_number_id` + `access_token`
+- Inbound webhooks are configured in Meta's WhatsApp Cloud API dashboard pointing to TRUSTNOW's webhook endpoint
+
+---
+
+#### `GET /whatsapp/accounts` — List connected WhatsApp accounts
+
+```typescript
+// Response 200
+{
+  accounts: Array<{
+    wa_account_id: string,
+    phone_number: string,          // E.164
+    display_name: string,
+    agent_id: string | null,
+    agent_name: string | null,
+    status: 'active' | 'paused' | 'disconnected',
+    respond_with_audio: boolean
+  }>
+}
+```
+
+#### `POST /whatsapp/accounts/connect` — OAuth callback after Meta Facebook login
+
+```typescript
+// Called after the Facebook OAuth redirect completes
+// The frontend receives the OAuth code from Meta and passes it here
+export class ConnectWhatsAppDto {
+  oauth_code: string;     // from Meta OAuth redirect
+  waba_id: string;        // WhatsApp Business Account ID selected by user
+  phone_number_id: string;
+}
+
+// Logic:
+// 1. Exchange oauth_code for long-lived access token via Meta Graph API
+// 2. Encrypt access token and store (Vault path: trustnow/{tenant_id}/whatsapp/{wa_account_id})
+// 3. Fetch phone number details from Meta API (number, display name)
+// 4. INSERT whatsapp_accounts row
+// 5. Register TRUSTNOW webhook URL with Meta WhatsApp Cloud API for this account:
+//    POST https://graph.facebook.com/v19.0/{phone_number_id}/subscribed_apps
+// Response 201: { wa_account_id, phone_number, display_name }
+```
+
+#### `PUT /whatsapp/accounts/:id` — Update account settings
+
+```typescript
+export class UpdateWhatsAppAccountDto {
+  agent_id?: string | null;      // assign/unassign agent
+  respond_with_audio?: boolean;  // audio vs text-only responses
+  status?: 'active' | 'paused';
+}
+// Response 200: { updated_at }
+```
+
+#### `DELETE /whatsapp/accounts/:id` — Disconnect account
+
+```typescript
+// 1. Deregister TRUSTNOW webhook from Meta API
+// 2. Revoke access token
+// 3. SET status = 'disconnected' (soft delete)
+// Response 200: { disconnected: true }
+```
+
+#### `POST /whatsapp/accounts/:id/outbound-message` — Send outbound WhatsApp message
+
+```typescript
+export class SendWhatsAppMessageDto {
+  recipient_wa_id: string;        // WhatsApp user ID of recipient
+  template_name: string;          // pre-approved Meta message template name
+  template_parameters?: string[]; // variable values for the template
+  agent_id?: string;              // override account's default agent for this conversation
+}
+// Calls Meta Graph API: POST /messages with template payload
+// Response 202: { message_id, status: 'sent' }
+```
+
+#### `POST /whatsapp/accounts/:id/outbound-call` — Initiate outbound WhatsApp call
+
+```typescript
+export class InitiateWhatsAppCallDto {
+  recipient_wa_id: string;
+  permission_template_name: string;  // call permission request template (Meta requirement)
+  agent_id?: string;
+}
+// Logic:
+// 1. Send call permission request template via Meta API
+// 2. Meta delivers template to user's WhatsApp
+// 3. User approves → Meta sends callback event to TRUSTNOW webhook
+// 4. TRUSTNOW webhook handler (POST /whatsapp/webhook) receives approval
+// 5. Initiates WebRTC call via WhatsApp Cloud API
+// Response 202: { permission_request_sent: true }
+```
+
+#### `POST /whatsapp/webhook` — Inbound webhook from Meta (all WhatsApp events)
+
+```typescript
+// Called by Meta WhatsApp Cloud API for ALL events:
+// - Incoming messages (text/audio/image/document/location/contact)
+// - Incoming calls
+// - Message status updates (delivered/read)
+// - Call permission approvals
+// - Account status changes
+
+// Signature verification: X-Hub-Signature-256 header checked against app secret
+// Route events to:
+//   message → WhatsApp message handler → agent conversation
+//   call_initiated → WhatsApp call handler → agent call session
+//   call_permission_granted → initiate outbound call
+//   status_update → update message/call status in DB
+
+// Response 200: { status: 'ok' } — Meta requires 200 within 5 seconds
+```
+
+**Inbound message → Agent pipeline:**
+```
+Meta webhook POST → WhatsAppModule
+  → if type = 'audio': transcribe via STT (Deepgram) → text
+  → inject into agent conversation (same pipeline as widget text channel)
+  → LLM generates response
+  → if respond_with_audio = true: TTS → send audio via Meta API
+  → if respond_with_audio = false: send text via Meta API
+  → inject system__caller_id = sender's wa_id
+  → inject system__called_number = account phone_number_id
+```
+
+---
+
+**EXCEED ELEVENLABS — WhatsApp additions:**
+
+ElevenLabs provides basic WhatsApp messaging. TRUSTNOW adds:
+
+1. **Multi-account management:** BPO clients often manage WhatsApp Business Accounts on behalf of multiple end clients (e.g. a BPO managing WhatsApp for 5 brands). TRUSTNOW's accounts table supports multiple `whatsapp_accounts` per tenant. Each account shows the end-client brand name and can have a different agent assigned. ElevenLabs supports multiple accounts but with no brand labelling.
+
+2. **Message template library:** A dedicated "Templates" section in the WhatsApp account settings shows all approved Meta message templates for that account (fetched from Meta API). Agent admins can see template names, approval status, and parameter slots. Removes the need to switch to Meta Business Manager to look up template names during outbound campaign setup.
+
+3. **WhatsApp conversation continuity:** On WhatsApp, the same phone number may message again hours later — this should resume the same conversation thread (not start a new one) within a configurable session window (e.g. 24 hours). `conversations.wa_thread_id` + session TTL logic. ElevenLabs starts a new conversation for every new message.
+
+4. **Handover to human agent via WhatsApp:** When the AI triggers a human handoff, TRUSTNOW can transfer the WhatsApp thread to a human agent's WhatsApp Business Manager inbox rather than just terminating. Uses Meta's Agent Handover Protocol. Critical for BPO clients who want seamless AI-to-human escalation on WhatsApp.
+
+---
+
+### 6.2S — SettingsModule Endpoint Contracts (CO-BROWSING §17)
+
+**Scope:** All endpoints in this module operate at workspace (tenant) level — not agent level.
+
+**Auto-save pattern (§17.1 confirmed):** The Settings page auto-saves without a manual Save button. Frontend debounces `PUT /workspace/settings` by 1 second after any field change.
+
+---
+
+#### Workspace Settings
+
+```typescript
+// GET /workspace/settings — load current workspace settings
+// Response 200
+{
+  conversation_initiation_webhook_url: string | null,
+  conversation_initiation_webhook_auth: object,
+  post_call_webhook_url: string | null,
+  post_call_webhook_secret: string | null,    // masked: "••••••••" if set, null if not
+  post_call_webhook_auth: object
+}
+
+// PUT /workspace/settings — update workspace settings (auto-save, partial update)
+export class UpdateWorkspaceSettingsDto {
+  conversation_initiation_webhook_url?: string | null;
+  conversation_initiation_webhook_auth?: object;
+  post_call_webhook_url?: string | null;
+  post_call_webhook_secret?: string | null;
+  post_call_webhook_auth?: object;
+}
+// UPSERT workspace_settings on conflict (tenant_id)
+// Response 200: { updated_at }
+
+// POST /workspace/settings/webhooks/test — test a webhook (same pattern as agent webhooks)
+export class TestWorkspaceWebhookDto {
+  webhook_type: 'initiation' | 'post_call';
+  url: string;
+}
+// Sends synthetic payload to URL, returns { success: boolean, http_status: number, response_time_ms: number }
+```
+
+**Webhook fallback logic (§17.8 confirmed):**
+```typescript
+// Executed by AI Pipeline at call start and call end
+function resolveWebhook(agent_config, workspace_settings, event_type) {
+  const agent_url = event_type === 'initiation'
+    ? agent_config.conversation_initiation_webhook_url
+    : agent_config.post_call_webhook_url;
+
+  // Agent-level takes priority; workspace default is fallback
+  return agent_url ?? workspace_settings[`${event_type === 'initiation' ? 'conversation_initiation' : 'post_call'}_webhook_url`];
+}
+```
+
+---
+
+#### Workspace Secrets
+
+```typescript
+// GET /workspace/secrets — list all secrets (names only — values never returned)
+// Response 200
+{
+  secrets: Array<{
+    secret_id: string,
+    name: string,           // e.g. 'CRM_TOKEN'
+    created_by: string,     // user email
+    created_at: string
+    // value is NEVER included — write-once, cannot be retrieved
+  }>
+}
+
+// POST /workspace/secrets — create a new secret
+export class CreateSecretDto {
+  name: string;    // validated: alphanumeric + underscores only, max 100 chars
+  value: string;   // the actual secret value — encrypted immediately on receipt
+}
+// Logic:
+// 1. Validate name matches /^[A-Z0-9_]+$/ (uppercase convention)
+// 2. Check no existing secret with same name for this tenant (UNIQUE constraint)
+// 3. Encrypt value via Vault KV: path = trustnow/{tenant_id}/secrets/{name}
+// 4. Store vault_path reference in workspace_secrets.value_enc
+// Response 201: { secret_id, name }
+// Note: value is NOT returned in the response
+
+// DELETE /workspace/secrets/:id — delete a secret
+// Deletes from Vault + workspace_secrets table
+// WARNING: any tools referencing {{secret.NAME}} will fail after deletion
+// Response 200: { deleted: true }
+```
+
+---
+
+#### Workspace Auth Connections
+
+```typescript
+// GET /workspace/auth-connections — list auth connections (config masked)
+// Response 200
+{
+  connections: Array<{
+    auth_id: string,
+    name: string,
+    auth_type: 'oauth2' | 'api_key' | 'bearer' | 'basic',
+    created_at: string
+    // config_enc is NEVER returned — sensitive credentials
+  }>
+}
+
+// POST /workspace/auth-connections — create auth connection
+export class CreateAuthConnectionDto {
+  name: string;
+  auth_type: 'oauth2' | 'api_key' | 'bearer' | 'basic';
+  config: {
+    // oauth2
+    client_id?: string;
+    client_secret?: string;
+    token_url?: string;
+    scope?: string;
+    // api_key / bearer
+    token?: string;
+    header_name?: string;    // default 'Authorization' for bearer, 'X-API-Key' for api_key
+    // basic
+    username?: string;
+    password?: string;
+  };
+}
+// Encrypt config → store reference
+// Response 201: { auth_id, name, auth_type }
+
+// DELETE /workspace/auth-connections/:id
+// Warning check: if any tools reference this auth_id, return HTTP 409:
+// { error: "Cannot delete: N tools use this auth connection. Update tools first." }
+// Response 200: { deleted: true }
+```
+
+---
+
+**EXCEED ELEVENLABS — Settings additions:**
+
+ElevenLabs Settings has 4 sections. TRUSTNOW extends with:
+
+1. **Workspace-level PII redaction default:** A toggle in Settings: "Enable PII redaction for all new agents by default" — sets the default value of `pii_redaction_enabled` when a new agent is created. BPO clients creating 50+ agents want to set this once at workspace level rather than per-agent. Stored in `tenants.settings_json.default_pii_redaction`.
+
+2. **Secret usage audit:** Each secret in the list shows "Used by N tools" — clicking opens a panel listing which tools reference this secret. Before deleting a secret, the admin sees exactly what breaks. ElevenLabs shows no usage information.
+
+3. **Auth connection health check:** Each auth connection has a `Test` button — fires a test request using the stored credentials. Returns `✅ Valid` or `❌ Expired/Invalid`. OAuth2 connections auto-refresh when possible. BPO clients' CRM OAuth tokens expire — this surfaces it before it breaks live calls.
+
+4. **Webhook payload inspector:** The last N webhook deliveries (initiation + post-call) are shown in Settings with: timestamp / HTTP status / response time / payload preview. Helps diagnose webhook failures without needing external tooling. Stored in `webhook_deliveries` log table.
+
+---
+
+### 6.2T — ApiKeysModule Endpoint Contracts (CO-BROWSING §18)
+
+**Key format:** `sk-tn_{32 random chars}` — total ~42 chars. `sk-tn_` prefix is TRUSTNOW-specific (ElevenLabs uses `xi-api-key` header). TRUSTNOW API keys use `x-api-key` header.
+
+**One-time reveal pattern:** The actual key value is generated server-side, returned **once** in the creation response, and never stored. Only the SHA-256 hash is persisted. This mirrors GitHub, Stripe, and ElevenLabs key management.
+
+---
+
+#### `GET /api-keys` — List all API keys for tenant
+
+```typescript
+// Response 200 — key_hash and full key are NEVER returned
+{
+  api_keys: Array<{
+    key_id: string,
+    name: string,
+    key_prefix: string,          // e.g. 'sk-tn_ab' — for display identification
+    restrict_key: boolean,
+    monthly_credit_limit: number | null,
+    permissions: Record<string, string | null>,
+    last_used_at: string | null,
+    created_by: string,          // user email
+    created_at: string,
+    is_active: boolean
+  }>
+}
+```
+
+#### `POST /api-keys` — Create a new API key
+
+```typescript
+export class CreateApiKeyDto {
+  name?: string;                    // if omitted: auto-generate fun name (adjective + animal)
+  restrict_key?: boolean;           // default true
+  monthly_credit_limit?: number;    // null = unlimited
+  permissions?: Record<string, 'read' | 'write' | 'access' | null>;
+}
+
+// Logic:
+// 1. Generate key: 'sk-tn_' + crypto.randomBytes(24).toString('base64url')
+// 2. key_prefix = first 8 chars (e.g. 'sk-tn_ab')
+// 3. key_hash = SHA-256(full_key)
+// 4. INSERT api_keys row (store hash + prefix, NOT the key itself)
+// 5. Return full key in response — THIS IS THE ONLY TIME IT IS RETURNED
+
+// Response 201
+{
+  key_id: string,
+  name: string,
+  key: string,          // ⚠ ONLY TIME the full key is returned — show to user immediately
+  key_prefix: string,
+  created_at: string
+}
+```
+
+#### `PUT /api-keys/:id` — Update key name, permissions, or credit limit
+
+```typescript
+export class UpdateApiKeyDto {
+  name?: string;
+  restrict_key?: boolean;
+  monthly_credit_limit?: number | null;
+  permissions?: Record<string, 'read' | 'write' | 'access' | null>;
+}
+// Cannot change the key value itself — delete and recreate to rotate
+// Response 200: { updated_at }
+```
+
+#### `DELETE /api-keys/:id` — Revoke (deactivate) an API key
+
+```typescript
+// Sets is_active = false (soft delete — preserves audit trail)
+// All subsequent requests using this key receive HTTP 401
+// Response 200: { revoked: true }
+```
+
+#### API Key validation middleware (AuthModule)
+
+```typescript
+// Applied to ALL /api/* routes
+// Header: x-api-key: sk-tn_abcd1234...
+
+async validateApiKey(key: string): Promise<ApiKeyContext> {
+  const hash = SHA256(key);
+  const api_key = await db.query(
+    'SELECT * FROM api_keys WHERE key_hash = $1 AND is_active = true',
+    [hash]
+  );
+  if (!api_key) throw new UnauthorizedException('Invalid or revoked API key');
+
+  // Check monthly credit limit
+  if (api_key.monthly_credit_limit !== null) {
+    const used = await getMonthlyCreditsUsed(api_key.key_id);
+    if (used >= api_key.monthly_credit_limit) {
+      throw new ForbiddenException('Monthly credit limit exceeded');
+    }
+  }
+
+  // Check endpoint permission
+  const endpoint = resolveEndpointScope(request.path, request.method);
+  if (api_key.restrict_key) {
+    const allowed = api_key.permissions[endpoint];
+    if (!allowed) throw new ForbiddenException('Key does not have permission for this endpoint');
+  }
+
+  // Update last_used_at (async — don't block the request)
+  db.query('UPDATE api_keys SET last_used_at = NOW() WHERE key_id = $1', [api_key.key_id])
+    .catch(() => {});  // fire-and-forget
+
+  return { tenant_id: api_key.tenant_id, key_id: api_key.key_id };
+}
+```
+
+---
+
+**TRUSTNOW API Permission Scopes (§18.5 mapped from ElevenLabs):**
+
+| Scope | Access levels | Covers endpoints |
+|-------|--------------|-----------------|
+| `agents` | read / write | CRUD on agents, agent configs, all tabs |
+| `tts` | access | POST /tts/synthesise |
+| `stt` | access | POST /stt/transcribe |
+| `conversations` | read / write | GET/DELETE /conversations |
+| `workspace` | read / write | GET/PUT /workspace/settings |
+| `analytics` | access | GET /analytics/* |
+| `phone_numbers` | read / write | CRUD on /phone-numbers |
+| `batch_calls` | read / write | CRUD on /batch-calls |
+| `whatsapp` | read / write | CRUD on /whatsapp/accounts |
+| `kb` | read / write | CRUD on /kb/documents |
+| `tools` | read / write | CRUD on /tools |
+| `tests` | read / write | CRUD on /tests, /test-runs |
+| `voices` | read / write | CRUD on /voices |
+
+---
+
+**EXCEED ELEVENLABS — API Keys additions:**
+
+ElevenLabs API Keys have a static permission matrix. TRUSTNOW adds:
+
+1. **Key usage analytics:** Each key row shows "N API calls this month" + sparkline. Drilling in shows: calls per day, top endpoints called, average latency. BPO clients building CRM integrations need to monitor their API key usage to detect over-use or unexpected calls.
+
+2. **Key rotation wizard:** "Rotate key" button on any key — generates a new key value, returns it once, then deactivates the old key after a configurable grace period (e.g. 24 hours). This allows zero-downtime key rotation: update the integration, confirm it's working, the old key auto-revokes. ElevenLabs requires manual delete-and-recreate with no grace period.
+
+3. **IP allowlist per key:** Optional field on key creation: restrict the key to calls from specific IP ranges (CIDRs). BPO clients with on-premise CRM systems only call from known corporate IP ranges — this prevents key theft from being exploitable. Stored in `api_keys.allowed_ips TEXT[]`.
+
+---
+
+### 6.2U — WebhookEndpointsModule Endpoint Contracts (CO-BROWSING §19)
+
+**Important scope distinction (§19.1):**
+- **This module:** Platform-level event webhooks (voice removal, transcription complete) — at `/api/webhooks`
+- **§6.2I / §6.2S:** Conversation webhooks (initiation + post-call) — on auth_policies and workspace_settings
+- These are two separate systems. Do not conflate them.
+
+**TRUSTNOW header name:** `X-TRUSTNOW-Signature` (equivalent of ElevenLabs' `ElevenLabs-Signature`)
+
+---
+
+#### `GET /api/webhooks` — List webhook endpoints
+
+```typescript
+// Response 200
+{
+  endpoints: Array<{
+    endpoint_id: string,
+    url: string,
+    description: string | null,
+    events: string[],         // e.g. ['voice.removal', 'transcription.completed']
+    is_active: boolean,
+    created_at: string
+    // secret_enc is NEVER returned
+  }>
+}
+```
+
+#### `POST /api/webhooks` — Add endpoint
+
+```typescript
+export class CreateWebhookEndpointDto {
+  url: string;             // required, must be HTTPS
+  description?: string;
+  events: string[];        // at least one required
+                           // valid values: 'voice.removal' | 'transcription.completed'
+                           // + TRUSTNOW extensions (see §6.2U below)
+}
+
+// Logic:
+// 1. Validate URL is HTTPS
+// 2. Generate HMAC shared secret: crypto.randomBytes(32).toString('hex')
+// 3. Encrypt secret → store in endpoint.secret_enc
+// 4. INSERT webhook_endpoints row
+// 5. Return endpoint + secret (ONE-TIME — secret never returned again)
+
+// Response 201
+{
+  endpoint_id: string,
+  url: string,
+  secret: string,          // ⚠ ONLY TIME secret is returned — show in UI immediately
+  events: string[]
+}
+```
+
+#### `PUT /api/webhooks/:id` — Update endpoint
+
+```typescript
+export class UpdateWebhookEndpointDto {
+  url?: string;
+  description?: string;
+  events?: string[];
+  is_active?: boolean;
+}
+// Cannot rotate the secret via PUT — use POST /api/webhooks/:id/rotate-secret
+// Response 200: { updated_at }
+```
+
+#### `DELETE /api/webhooks/:id` — Delete endpoint
+
+```typescript
+// Hard delete — removes endpoint and stops all future deliveries
+// Preserves webhook_delivery_log rows for audit (FK: endpoint_id → SET NULL on delete)
+// Response 200: { deleted: true }
+```
+
+#### `POST /api/webhooks/:id/rotate-secret` — Rotate HMAC secret
+
+```typescript
+// Generates a new shared secret, returns it once
+// Old secret is immediately invalid
+// Response 200: { new_secret: string }  — show to user immediately
+```
+
+---
+
+#### TRUSTNOW Platform Event Catalogue
+
+The ElevenLabs events (voice.removal, transcription.completed) are baseline. TRUSTNOW extends with BPO-relevant events:
+
+| Event token | When it fires | BPO use case |
+|-------------|--------------|-------------|
+| `voice.removal` | A voice assigned to an agent is scheduled for removal | Alert operators before production voice is deprecated |
+| `transcription.completed` | Async STT job finishes (batch audio processing) | Notify when large audio file transcription is ready |
+| `agent.published` | Any agent in the workspace is published live | Notify CI/CD pipeline to run regression tests |
+| `agent.error` | Agent encounters a runtime error during a call | Real-time alerting for BPO supervisors |
+| `batch_call.completed` | A batch call campaign finishes | Notify CRM to process results |
+| `batch_call.failed` | A batch call campaign fails with errors | Alert BPO ops for intervention |
+| `knowledge_base.indexed` | A KB document finishes RAG indexing | Notify when updated KB is ready to serve |
+
+---
+
+#### Webhook delivery service (background)
+
+```typescript
+// Triggered by platform events — NOT an HTTP endpoint, runs as an event handler
+
+async function deliverWebhookEvent(event_type: string, tenant_id: string, data: object) {
+  // 1. Find all active endpoints subscribed to this event for this tenant
+  const endpoints = await db.query(
+    `SELECT * FROM webhook_endpoints
+     WHERE tenant_id = $1 AND is_active = true AND $2 = ANY(events)`,
+    [tenant_id, event_type]
+  );
+
+  for (const endpoint of endpoints) {
+    const payload = { event: event_type, timestamp: new Date().toISOString(), data };
+    const secret = await vault.getSecret(endpoint.secret_path);
+    const signature = 'sha256=' + HMAC_SHA256(JSON.stringify(payload), secret);
+
+    // POST with retry (3 attempts, exponential backoff: 5s / 25s / 125s)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(endpoint.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-TRUSTNOW-Signature': signature },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(10_000)   // 10s timeout
+        });
+        await db.insert('webhook_delivery_log', {
+          endpoint_id: endpoint.endpoint_id, event_type, payload, tenant_id,
+          http_status: res.status, success: res.ok, duration_ms, attempt_number: attempt
+        });
+        if (res.ok) break;  // success — no retry needed
+      } catch (err) {
+        await db.insert('webhook_delivery_log', {
+          endpoint_id: endpoint.endpoint_id, event_type, payload, tenant_id,
+          http_status: null, success: false, attempt_number: attempt
+        });
+        if (attempt < 3) await sleep(5 ** attempt * 1000);  // 5s, 25s
+      }
+    }
+  }
+}
+```
+
+---
+
+**EXCEED ELEVENLABS — Webhooks additions:**
+
+ElevenLabs has 2 platform events. TRUSTNOW adds:
+
+1. **7 BPO-relevant events** (agent.published, agent.error, batch_call.completed, batch_call.failed, knowledge_base.indexed) as listed above. BPO clients integrate TRUSTNOW into their CI/CD, alerting, and CRM systems — they need rich event coverage.
+
+2. **Delivery log in UI:** Each endpoint row shows "Last delivery: 200 OK (245ms) — 2 minutes ago" or "Last delivery: ❌ 503 — 4 hours ago (3 retries failed)". Click → opens full delivery log with payload previews and retry button. ElevenLabs has no delivery log in the UI.
+
+3. **Event filtering:** When an endpoint receives events, an optional `filter` field (JSONPath expression) reduces noise — e.g. "only fire `agent.error` when the agent_id is in [list]". Prevents webhook floods when many agents are deployed. ElevenLabs has no event filtering.
+
+---
+
+### 6.2V — EnvVarsModule Endpoint Contracts (CO-BROWSING §20)
+
+---
+
+#### `GET /env-vars` — List all environment variables
+
+```typescript
+// Response 200
+{
+  variables: Array<{
+    var_id: string,
+    name: string,                  // e.g. 'MY_API_URL'
+    var_type: 'string' | 'number' | 'boolean',
+    environments_configured: number,  // count of environment rows set
+    updated_at: string
+    // values are NOT returned in list — use GET /env-vars/:id for full detail
+  }>
+}
+```
+
+#### `GET /env-vars/:id` — Get variable with all environment values
+
+```typescript
+// Response 200
+{
+  var_id: string,
+  name: string,
+  var_type: string,
+  values: Array<{
+    environment: string,   // 'production' | 'staging' | 'development' | custom
+    value: string
+  }>
+}
+```
+
+#### `POST /env-vars` — Create a new environment variable
+
+```typescript
+export class CreateEnvVarDto {
+  name: string;                          // snake_case, validated: /^[a-zA-Z][a-zA-Z0-9_]*$/
+  var_type?: 'string' | 'number' | 'boolean';  // default 'string'
+  values: Array<{
+    environment: string;
+    value: string;
+  }>;  // at least one value required; production should always be set
+}
+
+// Logic:
+// 1. Validate name format
+// 2. Check UNIQUE(tenant_id, name) — HTTP 409 if duplicate
+// 3. INSERT environment_variables row
+// 4. INSERT environment_variable_values for each value in dto.values
+// 5. Return { var_id, name, values }
+// Response 201: { var_id, name, var_type, values }
+```
+
+#### `PUT /env-vars/:id` — Update variable (name, type, values)
+
+```typescript
+export class UpdateEnvVarDto {
+  name?: string;
+  var_type?: string;
+  values?: Array<{ environment: string; value: string }>;
+}
+// For values: UPSERT on conflict(var_id, environment) — update value, or insert new env row
+// Response 200: { updated_at }
+```
+
+#### `DELETE /env-vars/:id`
+
+```typescript
+// CASCADE deletes all environment_variable_values rows
+// Warning: any agent configs referencing {{env.VAR_NAME}} will fail after deletion
+// Response 200: { deleted: true }
+```
+
+---
+
+#### Variable Resolution Service (Platform Engine — §20.4)
+
+The resolution service is called at **conversation initiation time** whenever a `{{env.VAR_NAME}}` token is found in an agent config field.
+
+```typescript
+async function resolveEnvVars(
+  text: string,
+  tenant_id: string,
+  environment: string   // 'production' | 'staging' | 'development'
+): Promise<string> {
+
+  // Find all {{env.VAR_NAME}} tokens in the text
+  const tokens = text.match(/\{\{env\.([A-Za-z][A-Za-z0-9_]*)\}\}/g) ?? [];
+
+  for (const token of tokens) {
+    const varName = token.replace('{{env.', '').replace('}}', '');
+
+    // 1. Find variable by name for this tenant
+    const variable = await db.query(
+      'SELECT var_id FROM environment_variables WHERE tenant_id = $1 AND name = $2',
+      [tenant_id, varName]
+    );
+    if (!variable) throw new Error(`Environment variable '${varName}' not found`);
+
+    // 2. Look for value in current environment
+    let value = await db.query(
+      'SELECT value FROM environment_variable_values WHERE var_id = $1 AND environment = $2',
+      [variable.var_id, environment]
+    );
+
+    // 3. Fall back to production if no env-specific value (§20.4 confirmed)
+    if (!value) {
+      value = await db.query(
+        'SELECT value FROM environment_variable_values WHERE var_id = $1 AND environment = $2',
+        [variable.var_id, 'production']
+      );
+    }
+
+    if (!value) throw new Error(`Variable '${varName}' has no value for environment '${environment}' and no production fallback`);
+
+    text = text.replace(token, value.value);
+  }
+  return text;
+}
+```
+
+**Where resolution runs:**
+- `system_prompt` — resolved before first LLM call
+- `first_message` — resolved before TTS
+- Tool webhook `url` and `headers` — resolved before each tool invocation
+- MCP server `server_url` — resolved at connection time
+
+---
+
+#### Variable Injection Reference (§20.7 — For Platform Engineer reference)
+
+| Type | Syntax | Where defined | When resolved | Use case |
+|------|--------|--------------|--------------|---------|
+| **Environment Variables** | `{{env.NAME}}` | ElevenAPI → Env Vars | Conversation start | Config values per environment |
+| **Dynamic Variables** | `{{variable_name}}` | Passed at call initiation (SIP headers, API params) | Call start | Per-caller personalisation |
+| **Workspace Secrets** | `{{secret.NAME}}` | ElevenAgents Settings → Workspace Secrets | Tool execution | API keys, passwords |
+| **System Variables** | `{{system__caller_id}}` | Auto-injected by platform | Call start | Caller ID, called number, WhatsApp WA ID |
+
+All four types coexist in the same text fields. Resolution order: env vars → dynamic vars → secrets → system vars.
+
+---
+
+**EXCEED ELEVENLABS — Environment Variables additions:**
+
+ElevenLabs supports 3 fixed environments (production/staging/development). TRUSTNOW adds:
+
+1. **Custom environment names:** BPO clients managing multiple client deployments on the same platform create named environments per client: "client_a_prod", "client_b_uat", "client_b_staging". Stored as free-form strings in `environment_variable_values.environment`. No validation beyond unique constraint per variable.
+
+2. **Variable usage scanner:** A `Where used` button on each variable → scans all agent configs, tool definitions, and MCP server URLs for `{{env.VAR_NAME}}` references. Returns a list: "Used in 3 agents, 7 tool configs". Prevents accidental deletion of variables that are actively in production. ElevenLabs has no usage tracking.
+
+3. **Bulk export/import:** Export all environment variables for a workspace as a JSON file (for environment migration or backup). Import a JSON file to restore or replicate variables. BPO clients manage multiple TRUSTNOW instances (prod/staging) and need to sync variable sets.
+
+---
+
+### 6.2W — StandaloneTTSModule Endpoint Contracts (CO-BROWSING §21)
+
+**Scope note:** This module covers the **standalone async TTS tool** (ElevenCreative → Text to Speech). It is completely separate from the realtime conversation TTS pipeline (Task 9 `tts_adapter.py`). Do not confuse the two.
+
+| | Standalone TTS (this module) | Realtime TTS (Task 9) |
+|--|------------------------------|----------------------|
+| Use | IVR prompts, on-hold messages, bulk audio | Live conversation turns |
+| Latency requirement | None — async | < 500ms TTFB |
+| Model | eleven_multilingual_v2 / eleven_v3 | eleven_flash_v2_5 only |
+| Max input | 5,000 chars | One turn (typically < 200 chars) |
+| Storage | MinIO `trustnow-tts-generations` | Not stored (streamed) |
+
+---
+
+#### `POST /tts/generate` — Generate a TTS audio file
+
+```typescript
+export class GenerateTtsDto {
+  text: string;                      // required, max 5,000 chars
+  voice_id: string;                  // required
+  model_id?: string;                 // default 'eleven_multilingual_v2'
+  stability?: number;                // 0.0–1.0, default 0.5
+  similarity_boost?: number;         // 0.0–1.0, default 0.75
+  style_exaggeration?: number;       // 0.0–1.0, default 0.0
+  speed?: number;                    // 0.5–2.0, default 1.0
+  use_speaker_boost?: boolean;       // default true (uses extra credits)
+  language_override?: string;        // ISO language code, null = auto
+  output_format?: string;            // default 'mp3_128000'
+}
+
+// Logic:
+// 1. Validate text length ≤ 5,000 chars
+// 2. Check tenant credit balance
+// 3. Call ElevenLabs TTS API (Partition A) or Piper (Partition B):
+//    POST /v1/text-to-speech/{voice_id} with voice_settings
+// 4. Store audio file in MinIO: tts-generations/{tenant_id}/{generation_id}.mp3
+// 5. INSERT tts_generations row with all params + storage_path + credits_used
+// 6. Return generation_id + pre-signed download URL (1h TTL)
+
+// Response 201
+{
+  generation_id: string,
+  download_url: string,        // pre-signed MinIO URL, 1h TTL
+  duration_s: number,
+  credits_used: number
+}
+```
+
+#### `GET /tts/history` — List generation history
+
+```typescript
+// GET /tts/history?page=1&limit=20
+// Returns tts_generations for this tenant, newest first
+// Response 200: { generations: TtsGeneration[], total }
+// Each: generation_id, text (first 100 chars), voice name (joined), model_id, duration_s, created_at
+```
+
+#### `GET /tts/history/:id/download` — Get fresh download URL
+
+```typescript
+// Generates a new pre-signed MinIO URL for a past generation (original URLs expire after 1h)
+// Response 200: { download_url: string }
+```
+
+#### `DELETE /tts/history/:id` — Delete a generation
+
+```typescript
+// Deletes from MinIO + tts_generations row
+// Response 200: { deleted: true }
+```
+
+---
+
+**EXCEED ELEVENLABS — Standalone TTS additions:**
+
+1. **IVR prompt builder:** A structured form for generating telephony-ready IVR audio files: menu items (key press → description), greeting, hold message, error message. Generates correctly formatted audio: G711 μ-law 8kHz for SIP (auto-converted using the same `ulaw_encode()` pipeline as Task 9), or WAV for IP PBX systems. ElevenLabs generates generic MP3 — TRUSTNOW generates telephony-ready audio.
+
+2. **Bulk generation (batch TTS):** Upload a CSV with two columns: `filename` and `text`. System generates all files and delivers them as a ZIP download. BPO clients need hundreds of IVR prompt variations (per product, per language, per campaign). ElevenLabs TTS is single-text only.
+
+3. **Agent voice preview:** From any agent's Tab 1 (Voices panel), a `Preview` button generates a short TTS sample using the current voice + first 200 chars of the system prompt. Lets agent admins hear exactly how the agent will sound before publishing. Stored in `tts_generations` as `generation_type = 'preview'`.
+
+---
+
+### 6.2X — AsyncSTTModule Endpoint Contracts (CO-BROWSING §22)
+
+**Scope note:** This module covers the **standalone async STT tool** (ElevenCreative → Speech to Text). It is completely separate from the realtime STT in the conversation pipeline (Task 9 `stt_adapter.py`).
+
+| | Standalone STT (this module) | Realtime STT (Task 9) |
+|--|------------------------------|----------------------|
+| Input | Uploaded file / YouTube URL / any media URL | Live audio stream (WebSocket/WebRTC) |
+| Latency | None — async job (seconds to minutes) | < 200ms per turn |
+| Model | Scribe v2 (ElevenLabs) / Deepgram batch | Deepgram Nova-2 / FasterWhisper |
+| Max input | 1,000 MB file | One spoken turn |
+| Output | Full transcript JSON + SRT + plain text | Turn text (no timestamps) |
+| Storage | MinIO `trustnow-stt-transcripts` | Not stored (passed to LLM) |
+
+---
+
+#### `POST /stt/transcribe` — Submit transcription job
+
+```typescript
+// Multipart form-data for source_type='upload'
+// JSON body for source_type='youtube' or 'url'
+export class CreateTranscriptionDto {
+  source_type: 'upload' | 'youtube' | 'url';
+  source_url?: string;            // for youtube/url types
+  // file provided as multipart for upload type — max 1,000MB
+  title?: string;                 // auto-generated from filename if omitted
+  language_override?: string;     // null = Detect; ISO code for forced language
+  tag_audio_events?: boolean;     // default true
+  include_subtitles?: boolean;    // default false
+  no_verbatim?: boolean;          // default false
+  keyterms?: string[];            // domain vocabulary hints
+}
+
+// Logic:
+// 1. Validate input (file ≤ 1000MB, URL is accessible)
+// 2. For upload: store file in MinIO tts-transcripts/{tenant_id}/{transcript_id}.{ext}
+// 3. INSERT stt_transcripts row with status='pending'
+// 4. Queue async BullMQ job: 'stt-transcribe' with transcript_id
+// 5. Return transcript_id immediately (client polls or receives WS notification)
+
+// Response 202 (accepted, processing async)
+{ transcript_id: string, status: 'pending' }
+```
+
+#### Async transcription job
+
+```typescript
+// Queue: 'stt-transcribe'
+@Processor('stt-transcribe')
+async function processTranscription(job: Job<{ transcript_id: string }>) {
+  const tx = await db.getTranscript(job.data.transcript_id);
+  await db.updateStatus(tx.transcript_id, 'processing');
+
+  // Call ElevenLabs Scribe v2 API (Partition A) or Deepgram batch (Partition A alternative)
+  const response = await elevenLabsClient.speechToText({
+    audio: tx.source_type === 'upload' ? await minio.getStream(tx.storage_path) : null,
+    youtube_url: tx.source_type === 'youtube' ? tx.source_url : null,
+    url: tx.source_type === 'url' ? tx.source_url : null,
+    model_id: 'scribe_v2',
+    language_code: tx.language_override,        // null = auto-detect
+    tag_audio_events: tx.tag_audio_events,
+    diarize: true,                               // TRUSTNOW EXCEED: always diarize
+    timestamps_granularity: 'word',
+    additional_formats: tx.include_subtitles ? ['srt'] : [],
+    biased_keywords: tx.keyterms
+  });
+
+  await db.update('stt_transcripts', {
+    status: 'completed',
+    transcript_json: response.transcript,
+    plain_text: response.text,
+    srt_content: response.srt ?? null,
+    language_detected: response.language_code,
+    duration_seconds: response.duration,
+    credits_used: response.credits_consumed
+  }, { transcript_id: tx.transcript_id });
+
+  // Push WebSocket notification
+  wsGateway.emit(tx.tenant_id, { type: 'transcription_complete', transcript_id: tx.transcript_id });
+}
+```
+
+#### `GET /stt/transcripts` — List transcripts
+
+```typescript
+// GET /stt/transcripts?search=&status=&page=&limit=
+// Response 200: { transcripts: SttTranscript[], total }
+// Each: transcript_id, title, source_type, status, language_detected, duration_seconds, created_at
+```
+
+#### `GET /stt/transcripts/:id` — Get full transcript
+
+```typescript
+// Response 200: full stt_transcripts row
+// Includes: transcript_json (with word timestamps), plain_text, srt_content
+```
+
+#### `GET /stt/transcripts/:id/export` — Export in various formats
+
+```typescript
+// GET /stt/transcripts/:id/export?format=txt|pdf|docx|srt|json
+// Returns the transcript formatted appropriately, as a download
+
+// txt: plain_text field as a .txt file
+// json: transcript_json as a .json file
+// srt: srt_content as a .srt file (only if include_subtitles was true)
+// pdf: formatted PDF with title, timestamps, speaker labels
+// docx: Word document with same formatting as PDF
+```
+
+#### `PUT /stt/transcripts/:id` — Rename transcript
+
+```typescript
+export class UpdateTranscriptDto { title: string }
+// Response 200: { updated_at }
+```
+
+#### `DELETE /stt/transcripts/:id`
+
+```typescript
+// Deletes from MinIO (if upload type) + stt_transcripts row
+// Response 200: { deleted: true }
+```
+
+---
+
+**EXCEED ELEVENLABS — Async STT additions:**
+
+ElevenLabs Scribe has speaker diarization as an option. TRUSTNOW makes it standard and adds more:
+
+1. **Speaker diarization always ON:** TRUSTNOW always diarises (labels Speaker 1, Speaker 2 etc.) — output shows `Speaker 1: "..."` and `Speaker 2: "..."` in the transcript. Critical for call recording QA where you need to separate agent speech from caller speech. ElevenLabs has diarisation as an optional extra.
+
+2. **Auto-transcribe call recordings:** A toggle in the Privacy section of Tab 10 (Advanced): "Auto-transcribe recordings with async STT." When ON, every completed call recording is automatically submitted to `POST /stt/transcribe` with `source_type='upload'`. Creates a searchable transcript alongside the conversation record.
+
+3. **PII redaction on transcripts:** When `pii_redaction_enabled = true` on the agent AND a recording is auto-transcribed, the same PII patterns from §6.2H are applied to the transcript before storage. Produces a clean, auditable, GDPR-compliant record.
+
+4. **Transcript search index:** `plain_text` field indexed in PostgreSQL with `tsvector` full-text search. `GET /stt/transcripts?search=` uses `to_tsvector('english', plain_text) @@ to_tsquery(...)`. BPO compliance teams search across hundreds of transcripts for specific phrases, agent scripts, or customer complaints.
+
+---
+
+### Final Schema Summary — CO-BROWSING Translation Complete
+
+All 22 CO-BROWSING-DATA-001.md sections have been translated. Complete list of **new tables added** across Steps 1–21:
+
+| Table | Step | Purpose |
+|-------|------|---------|
+| `agent_branches` | 12 | Branch management (A/B testing) |
+| `agent_knowledge_base` | 7 | KB attachment junction table |
+| `agent_test_attachments` | 13 | Test attachment junction table |
+| `agent_tests` | 13 | QA test definitions |
+| `api_keys` | 17 | Platform API key management |
+| `batch_calls` | 10 | Outbound batch calling campaigns |
+| `batch_call_recipients` | 10 | Per-recipient status in batch |
+| `branch_versions` | 12 | Branch publish history |
+| `conversation_turns` | 8 | Per-turn latency and transcript |
+| `data_collection_specs` | 8 | Post-call data extraction specs |
+| `environment_variable_values` | 19 | Per-env variable values |
+| `environment_variables` | 19 | Env var definitions |
+| `evaluation_criteria` | 8 | Post-call success criteria |
+| `knowledge_base_docs` | 7 | Workspace-level KB documents (corrected from agent-scoped) |
+| `phone_numbers` | 9 | SIP trunk phone numbers |
+| `stt_transcripts` | 21 | Async STT transcript jobs |
+| `test_folders` | 13 | Test library folder organisation |
+| `test_runs` | 13 | Test execution records |
+| `tts_generations` | 20 | Standalone TTS generation history |
+| `webhook_delivery_log` | 18 | Webhook delivery audit log |
+| `webhook_endpoints` | 18 | Platform event webhook subscriptions |
+| `whatsapp_accounts` | 15 | WhatsApp Business Account connections |
+| `workflow_edges` | 11 | Workflow directed edges |
+| `workflow_nodes` | 11 | Workflow canvas nodes |
+| `workflow_versions` | 12 | Workflow version snapshots |
+| `workspace_auth_connections` | 16 | Reusable tool auth configs |
+| `workspace_secrets` | 16 | Encrypted workspace secrets |
+| `workspace_settings` | 16 | Workspace-level webhook defaults |
+
+**28 new tables** added across the full translation. Combined with the existing schema from Tasks 1–9, the TRUSTNOW platform schema is now complete.
+
+---
+
+Read RUNBOOK.md and confirm Task 6 is ✅ COMPLETE before starting.
 
 ```bash
 # Create FreeSWITCH config directory structure
@@ -4130,16 +7678,1078 @@ After all verifications pass, append a Task 7 entry to RUNBOOK.md in the COMPLET
 - **LiveKit SDK in AI pipeline:** The LiveKit Python SDK (`livekit` package) will be integrated into the AI pipeline turn loop in Task 9 when the full conversation runtime is built. Task 7 installs and verifies the LiveKit server only.
 - **FreeSWITCH dialplan curl integration:** The `mod_curl` call to Platform API `/api/sessions/initiate` in the inbound dialplan requires the sessions endpoint to be built in Task 9. The dialplan is installed here; the endpoint it calls is wired in Task 9.
 
+---
 
 ---
 
-## TASK 8 — AGENT CONFIGURATION MODULE (BRD §8.3)
+## TASK ADDENDUM — PRE-TASK-8 BACKFILL (CO-BROWSING TRANSLATION ADDITIONS)
+
+---
+
+### ▶ PLATFORM ENGINEER — SESSION START INSTRUCTIONS FOR TASK ADDENDUM
+
+Read RUNBOOK.md and confirm Task 7 is marked COMPLETE before starting this addendum.
+
+**Context:** After Task 7 was completed, the Master Architect completed a full co-browsing translation of CO-BROWSING-DATA-001.md v3.0 (22 sections). This added 28 new database tables, 21 new NestJS endpoint modules (§6.2D through §6.2X), two new AI pipeline services, and a FreeSWITCH outbound gateway requirement. All of this must be built and verified before Task 8 begins. Task 8 depends on these APIs being live.
+
+**Execute the four addendum tasks below in strict sequence: 4A → 5A → 6A → 7A.**
+
+**Full autonomy on all four tasks — no confirmation needed between steps. Report back only when all four addendum tasks are complete or if something fails.**
+
+---
+
+### ADDENDUM 4A — Database Schema Backfill
+
+**Objective:** Verify the live PostgreSQL instance has all 28 new tables added during the co-browsing translation. Run migrations for any that are missing.
+
+---
+
+#### Step 4A.1 — Audit existing schema
+
+```bash
+source /opt/trustnowailabs/trustnow-ai-worker-stack/config/vault/vault-env.sh
+PG_PASS=$(vault kv get -field=app_password secret/trustnow/platform/postgres)
+
+psql "postgresql://trustnow_app:$PG_PASS@127.0.0.1:5433/trustnow_platform" -c "
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'public'
+ORDER BY table_name;" 2>&1 | tee /tmp/schema_audit.txt
+
+echo "--- Schema audit complete. Review missing tables below. ---"
+```
+
+**Expected tables from the co-browsing translation — verify each exists:**
+```
+agent_branches             agent_knowledge_base        agent_test_attachments
+agent_tests                api_keys                    batch_calls
+batch_call_recipients      branch_versions             conversation_turns
+data_collection_specs      environment_variable_values environment_variables
+evaluation_criteria        knowledge_base_docs         phone_numbers
+stt_transcripts            test_folders                test_runs
+tts_generations            webhook_delivery_log        webhook_endpoints
+whatsapp_accounts          workflow_edges              workflow_nodes
+workflow_versions          workspace_auth_connections  workspace_secrets
+workspace_settings
+```
+
+---
+
+#### Step 4A.2 — Create migration file for missing tables
+
+```bash
+MIGRATION=/opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api/src/database/migrations/002_cobrowsing_additions.sql
+
+cat > $MIGRATION << 'MIGRATION_EOF'
+-- TRUSTNOW Migration 002: Co-browsing translation additions
+-- Run ONLY for tables that are confirmed missing from Step 4A.1 audit.
+-- Each CREATE TABLE is wrapped in IF NOT EXISTS to be idempotent.
+
+-- ── AGENT BRANCHES & VERSIONS ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_branches (
+  branch_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id          UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  tenant_id         UUID NOT NULL REFERENCES tenants(tenant_id),
+  name              VARCHAR(100) NOT NULL,
+  description       TEXT,
+  traffic_split     DECIMAL(5,2) DEFAULT 0.00,
+  status            VARCHAR(20) DEFAULT 'draft',
+  is_protected      BOOLEAN DEFAULT false,
+  parent_branch_id  UUID REFERENCES agent_branches(branch_id),
+  created_by        UUID REFERENCES users(user_id),
+  created_at        TIMESTAMPTZ DEFAULT now(),
+  updated_at        TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE agent_branches ENABLE ROW LEVEL SECURITY;
+CREATE POLICY agent_branches_tenant ON agent_branches USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE INDEX IF NOT EXISTS idx_agent_branches_agent ON agent_branches(agent_id);
+
+CREATE TABLE IF NOT EXISTS branch_versions (
+  version_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  branch_id        UUID NOT NULL REFERENCES agent_branches(branch_id) ON DELETE CASCADE,
+  tenant_id        UUID NOT NULL REFERENCES tenants(tenant_id),
+  version_number   INTEGER NOT NULL,
+  snapshot         JSONB NOT NULL,
+  published_by     UUID REFERENCES users(user_id),
+  published_at     TIMESTAMPTZ DEFAULT now(),
+  notes            TEXT
+);
+ALTER TABLE branch_versions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY branch_versions_tenant ON branch_versions USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- ── WORKFLOW TABLES ───────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS workflow_nodes (
+  node_id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id                  UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  branch_id                 UUID NOT NULL,
+  tenant_id                 UUID NOT NULL REFERENCES tenants(tenant_id),
+  node_type                 VARCHAR(30) NOT NULL,
+  label                     VARCHAR(100),
+  conversation_goal         TEXT,
+  override_prompt           BOOLEAN DEFAULT false,
+  voice_id                  UUID,
+  llm_model                 VARCHAR(50),
+  eagerness                 VARCHAR(20),
+  spelling_patience         VARCHAR(10),
+  speculative_turn_enabled  BOOLEAN,
+  position_x                FLOAT NOT NULL DEFAULT 0,
+  position_y                FLOAT NOT NULL DEFAULT 0,
+  config                    JSONB DEFAULT '{}',
+  created_at                TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE workflow_nodes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY workflow_nodes_tenant ON workflow_nodes USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE INDEX IF NOT EXISTS idx_workflow_nodes_agent_branch ON workflow_nodes(agent_id, branch_id);
+
+CREATE TABLE IF NOT EXISTS workflow_edges (
+  edge_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id         UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  branch_id        UUID NOT NULL,
+  tenant_id        UUID NOT NULL REFERENCES tenants(tenant_id),
+  source_node_id   UUID NOT NULL REFERENCES workflow_nodes(node_id) ON DELETE CASCADE,
+  target_node_id   UUID NOT NULL REFERENCES workflow_nodes(node_id) ON DELETE CASCADE,
+  condition_label  VARCHAR(200),
+  condition_type   VARCHAR(20) DEFAULT 'llm_evaluated',
+  priority         INTEGER DEFAULT 0,
+  created_at       TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE workflow_edges ENABLE ROW LEVEL SECURITY;
+CREATE POLICY workflow_edges_tenant ON workflow_edges USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS workflow_versions (
+  version_id   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id     UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  branch_id    UUID NOT NULL,
+  tenant_id    UUID NOT NULL REFERENCES tenants(tenant_id),
+  nodes_json   JSONB NOT NULL,
+  edges_json   JSONB NOT NULL,
+  saved_by     UUID REFERENCES users(user_id),
+  saved_at     TIMESTAMPTZ DEFAULT now(),
+  notes        TEXT
+);
+ALTER TABLE workflow_versions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY workflow_versions_tenant ON workflow_versions USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- ── KNOWLEDGE BASE JUNCTION ───────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_knowledge_base (
+  agent_id     UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  kb_doc_id    UUID NOT NULL REFERENCES knowledge_base_docs(doc_id) ON DELETE CASCADE,
+  branch_id    UUID,
+  attached_at  TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (agent_id, kb_doc_id, COALESCE(branch_id, '00000000-0000-0000-0000-000000000000'::UUID))
+);
+CREATE INDEX IF NOT EXISTS idx_akb_agent ON agent_knowledge_base(agent_id, branch_id);
+CREATE INDEX IF NOT EXISTS idx_akb_doc ON agent_knowledge_base(kb_doc_id);
+
+-- ── TESTS ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS test_folders (
+  folder_id  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id  UUID NOT NULL REFERENCES tenants(tenant_id),
+  name       VARCHAR(100) NOT NULL,
+  created_by UUID REFERENCES users(user_id),
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE test_folders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY test_folders_tenant ON test_folders USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS agent_tests (
+  test_id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id          UUID NOT NULL REFERENCES tenants(tenant_id),
+  folder_id          UUID REFERENCES test_folders(folder_id),
+  name               VARCHAR(200) NOT NULL,
+  test_type          VARCHAR(20) NOT NULL,
+  is_template        BOOLEAN DEFAULT false,
+  created_by         UUID REFERENCES users(user_id),
+  conversation       JSONB DEFAULT '[]',
+  expected_criteria  TEXT,
+  success_examples   JSONB DEFAULT '[]',
+  failure_examples   JSONB DEFAULT '[]',
+  tool_type          VARCHAR(30),
+  target_agent_id    UUID REFERENCES agents(agent_id),
+  target_node_id     UUID,
+  should_invoke      BOOLEAN DEFAULT true,
+  user_scenario      TEXT,
+  success_criteria   TEXT,
+  max_turns          INTEGER DEFAULT 5,
+  mock_all_tools     BOOLEAN DEFAULT false,
+  dynamic_variables  JSONB DEFAULT '{}',
+  created_at         TIMESTAMPTZ DEFAULT now(),
+  updated_at         TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE agent_tests ENABLE ROW LEVEL SECURITY;
+CREATE POLICY agent_tests_tenant ON agent_tests USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS agent_test_attachments (
+  agent_id    UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  test_id     UUID NOT NULL REFERENCES agent_tests(test_id) ON DELETE CASCADE,
+  attached_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (agent_id, test_id)
+);
+
+CREATE TABLE IF NOT EXISTS test_runs (
+  run_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  test_id        UUID NOT NULL REFERENCES agent_tests(test_id) ON DELETE CASCADE,
+  tenant_id      UUID NOT NULL REFERENCES tenants(tenant_id),
+  agent_id       UUID NOT NULL REFERENCES agents(agent_id),
+  branch_id      UUID NOT NULL,
+  status         VARCHAR(20) DEFAULT 'running',
+  result_detail  JSONB,
+  duration_ms    INTEGER,
+  run_by         UUID REFERENCES users(user_id),
+  created_at     TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE test_runs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY test_runs_tenant ON test_runs USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- ── BATCH CALLING ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS batch_calls (
+  batch_call_id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id                UUID NOT NULL REFERENCES tenants(tenant_id),
+  name                     VARCHAR(100) NOT NULL DEFAULT 'Untitled Batch',
+  agent_id                 UUID NOT NULL REFERENCES agents(agent_id),
+  phone_number_id          UUID NOT NULL REFERENCES phone_numbers(phone_number_id),
+  status                   VARCHAR(20) DEFAULT 'pending',
+  ringing_timeout_s        INTEGER DEFAULT 60,
+  concurrency_limit        INTEGER,
+  total_recipients         INTEGER DEFAULT 0,
+  calls_completed          INTEGER DEFAULT 0,
+  calls_failed             INTEGER DEFAULT 0,
+  calls_pending            INTEGER DEFAULT 0,
+  scheduled_at             TIMESTAMPTZ,
+  timezone                 VARCHAR(60),
+  started_at               TIMESTAMPTZ,
+  completed_at             TIMESTAMPTZ,
+  compliance_acknowledged  BOOLEAN DEFAULT false,
+  created_by               UUID REFERENCES users(user_id),
+  created_at               TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE batch_calls ENABLE ROW LEVEL SECURITY;
+CREATE POLICY batch_calls_tenant ON batch_calls USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS batch_call_recipients (
+  recipient_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  batch_call_id   UUID NOT NULL REFERENCES batch_calls(batch_call_id) ON DELETE CASCADE,
+  tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+  phone_number    VARCHAR(20) NOT NULL,
+  dynamic_variables JSONB DEFAULT '{}',
+  overrides       JSONB DEFAULT '{}',
+  status          VARCHAR(20) DEFAULT 'pending',
+  conversation_id UUID REFERENCES conversations(conversation_id),
+  attempted_at    TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE batch_call_recipients ENABLE ROW LEVEL SECURITY;
+CREATE POLICY batch_call_recipients_tenant ON batch_call_recipients USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE INDEX IF NOT EXISTS idx_bcr_batch ON batch_call_recipients(batch_call_id, status);
+
+-- ── WHATSAPP ──────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS whatsapp_accounts (
+  wa_account_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id          UUID NOT NULL REFERENCES tenants(tenant_id),
+  meta_waba_id       VARCHAR(100) NOT NULL,
+  phone_number_id    VARCHAR(100) NOT NULL,
+  phone_number       VARCHAR(20),
+  display_name       VARCHAR(100),
+  agent_id           UUID REFERENCES agents(agent_id),
+  access_token_enc   TEXT,
+  respond_with_audio BOOLEAN DEFAULT true,
+  status             VARCHAR(20) DEFAULT 'active',
+  created_at         TIMESTAMPTZ DEFAULT now(),
+  updated_at         TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE whatsapp_accounts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY whatsapp_accounts_tenant ON whatsapp_accounts USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- ── WORKSPACE SETTINGS, SECRETS, AUTH CONNECTIONS ────────────────────────────
+CREATE TABLE IF NOT EXISTS workspace_settings (
+  tenant_id                              UUID PRIMARY KEY REFERENCES tenants(tenant_id),
+  conversation_initiation_webhook_url    TEXT,
+  conversation_initiation_webhook_auth   JSONB DEFAULT '{}',
+  post_call_webhook_url                  TEXT,
+  post_call_webhook_secret               TEXT,
+  post_call_webhook_auth                 JSONB DEFAULT '{}',
+  updated_at                             TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS workspace_secrets (
+  secret_id   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id   UUID NOT NULL REFERENCES tenants(tenant_id),
+  name        VARCHAR(100) NOT NULL,
+  value_enc   TEXT NOT NULL,
+  created_by  UUID REFERENCES users(user_id),
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (tenant_id, name)
+);
+ALTER TABLE workspace_secrets ENABLE ROW LEVEL SECURITY;
+CREATE POLICY workspace_secrets_tenant ON workspace_secrets USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS workspace_auth_connections (
+  auth_id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id   UUID NOT NULL REFERENCES tenants(tenant_id),
+  name        VARCHAR(100) NOT NULL,
+  auth_type   VARCHAR(20) NOT NULL,
+  config_enc  JSONB NOT NULL,
+  created_by  UUID REFERENCES users(user_id),
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  updated_at  TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE workspace_auth_connections ENABLE ROW LEVEL SECURITY;
+CREATE POLICY workspace_auth_connections_tenant ON workspace_auth_connections USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- ── API KEYS ──────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS api_keys (
+  key_id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id            UUID NOT NULL REFERENCES tenants(tenant_id),
+  name                 VARCHAR(100) NOT NULL,
+  key_hash             VARCHAR(64) NOT NULL UNIQUE,
+  key_prefix           VARCHAR(12) NOT NULL,
+  restrict_key         BOOLEAN DEFAULT true,
+  monthly_credit_limit INTEGER,
+  permissions          JSONB DEFAULT '{}',
+  last_used_at         TIMESTAMPTZ,
+  created_by           UUID REFERENCES users(user_id),
+  created_at           TIMESTAMPTZ DEFAULT now(),
+  is_active            BOOLEAN DEFAULT true
+);
+ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
+CREATE POLICY api_keys_tenant ON api_keys USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- ── PLATFORM WEBHOOKS ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+  endpoint_id  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id    UUID NOT NULL REFERENCES tenants(tenant_id),
+  url          VARCHAR(500) NOT NULL,
+  description  TEXT,
+  secret_enc   TEXT NOT NULL,
+  events       TEXT[] NOT NULL,
+  is_active    BOOLEAN DEFAULT true,
+  created_by   UUID REFERENCES users(user_id),
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  updated_at   TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE webhook_endpoints ENABLE ROW LEVEL SECURITY;
+CREATE POLICY webhook_endpoints_tenant ON webhook_endpoints USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS webhook_delivery_log (
+  delivery_id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  endpoint_id     UUID REFERENCES webhook_endpoints(endpoint_id) ON DELETE SET NULL,
+  tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+  event_type      VARCHAR(50) NOT NULL,
+  payload         JSONB NOT NULL,
+  http_status     INTEGER,
+  response_body   TEXT,
+  duration_ms     INTEGER,
+  success         BOOLEAN,
+  attempt_number  INTEGER DEFAULT 1,
+  attempted_at    TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE webhook_delivery_log ENABLE ROW LEVEL SECURITY;
+CREATE POLICY webhook_delivery_log_tenant ON webhook_delivery_log USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE INDEX IF NOT EXISTS idx_wdl_endpoint ON webhook_delivery_log(endpoint_id, attempted_at DESC);
+
+-- ── ENVIRONMENT VARIABLES ─────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS environment_variables (
+  var_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id   UUID NOT NULL REFERENCES tenants(tenant_id),
+  name        VARCHAR(100) NOT NULL,
+  var_type    VARCHAR(20) DEFAULT 'string',
+  created_by  UUID REFERENCES users(user_id),
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  updated_at  TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (tenant_id, name)
+);
+ALTER TABLE environment_variables ENABLE ROW LEVEL SECURITY;
+CREATE POLICY environment_variables_tenant ON environment_variables USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS environment_variable_values (
+  value_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  var_id      UUID NOT NULL REFERENCES environment_variables(var_id) ON DELETE CASCADE,
+  environment VARCHAR(30) NOT NULL,
+  value       TEXT NOT NULL,
+  updated_at  TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (var_id, environment)
+);
+
+-- ── STANDALONE TTS GENERATIONS ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS tts_generations (
+  generation_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id            UUID NOT NULL REFERENCES tenants(tenant_id),
+  input_text           TEXT NOT NULL,
+  voice_id             UUID,
+  model_id             VARCHAR(50) NOT NULL,
+  stability            NUMERIC(3,2),
+  similarity_boost     NUMERIC(3,2),
+  style_exaggeration   NUMERIC(3,2),
+  speed                NUMERIC(3,2),
+  use_speaker_boost    BOOLEAN DEFAULT true,
+  language_override    VARCHAR(10),
+  output_format        VARCHAR(30) DEFAULT 'mp3_128000',
+  storage_path         TEXT,
+  duration_s           NUMERIC(8,2),
+  credits_used         INTEGER,
+  created_by           UUID REFERENCES users(user_id),
+  created_at           TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE tts_generations ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tts_generations_tenant ON tts_generations USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- ── ASYNC STT TRANSCRIPTS ────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS stt_transcripts (
+  transcript_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id          UUID NOT NULL REFERENCES tenants(tenant_id),
+  title              VARCHAR(200),
+  source_type        VARCHAR(10) NOT NULL,
+  source_url         TEXT,
+  storage_path       TEXT,
+  file_size_mb       DECIMAL(8,2),
+  duration_seconds   INTEGER,
+  language_detected  VARCHAR(10),
+  language_override  VARCHAR(10),
+  tag_audio_events   BOOLEAN DEFAULT true,
+  include_subtitles  BOOLEAN DEFAULT false,
+  no_verbatim        BOOLEAN DEFAULT false,
+  keyterms           TEXT[] DEFAULT '{}',
+  status             VARCHAR(20) DEFAULT 'pending',
+  transcript_json    JSONB,
+  srt_content        TEXT,
+  plain_text         TEXT,
+  credits_used       INTEGER,
+  error_message      TEXT,
+  created_by         UUID REFERENCES users(user_id),
+  created_at         TIMESTAMPTZ DEFAULT now(),
+  updated_at         TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE stt_transcripts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY stt_transcripts_tenant ON stt_transcripts USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+-- Full-text search index for transcript content
+CREATE INDEX IF NOT EXISTS idx_stt_plain_text ON stt_transcripts USING gin(to_tsvector('english', COALESCE(plain_text, '')));
+
+-- ── ANALYSIS / POST-CALL TABLES ───────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS conversation_turns (
+  turn_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  conversation_id UUID NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+  tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+  turn_index      INTEGER NOT NULL,
+  speaker         VARCHAR(10) NOT NULL,
+  text            TEXT,
+  tts_latency_ms  INTEGER,
+  stt_latency_ms  INTEGER,
+  llm_latency_ms  INTEGER,
+  started_at      TIMESTAMPTZ,
+  ended_at        TIMESTAMPTZ
+);
+ALTER TABLE conversation_turns ENABLE ROW LEVEL SECURITY;
+CREATE POLICY conversation_turns_tenant ON conversation_turns USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE INDEX IF NOT EXISTS idx_ct_conversation ON conversation_turns(conversation_id, turn_index);
+
+CREATE TABLE IF NOT EXISTS evaluation_criteria (
+  criteria_id  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id     UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  tenant_id    UUID NOT NULL REFERENCES tenants(tenant_id),
+  name         VARCHAR(200) NOT NULL,
+  prompt       TEXT NOT NULL,
+  result_type  VARCHAR(20) DEFAULT 'boolean',
+  created_at   TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE evaluation_criteria ENABLE ROW LEVEL SECURITY;
+CREATE POLICY evaluation_criteria_tenant ON evaluation_criteria USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE TABLE IF NOT EXISTS data_collection_specs (
+  spec_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id     UUID NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+  tenant_id    UUID NOT NULL REFERENCES tenants(tenant_id),
+  field_name   VARCHAR(100) NOT NULL,
+  description  TEXT NOT NULL,
+  data_type    VARCHAR(20) DEFAULT 'string',
+  created_at   TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE data_collection_specs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY data_collection_specs_tenant ON data_collection_specs USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+MIGRATION_EOF
+
+echo "Migration file written to $MIGRATION"
+```
+
+---
+
+#### Step 4A.3 — Verify three schema corrections in the live DB
+
+```bash
+PG_PASS=$(vault kv get -field=app_password secret/trustnow/platform/postgres)
+
+psql "postgresql://trustnow_app:$PG_PASS@127.0.0.1:5433/trustnow_platform" << 'EOF'
+-- Correction 1: knowledge_base_docs must NOT have agent_id column
+SELECT column_name FROM information_schema.columns
+WHERE table_name = 'knowledge_base_docs' AND column_name = 'agent_id';
+-- Expected: 0 rows. If 1 row returned → run: ALTER TABLE knowledge_base_docs DROP COLUMN agent_id;
+
+-- Correction 2: agent_configs must NOT have workflow_definition_json column
+SELECT column_name FROM information_schema.columns
+WHERE table_name = 'agent_configs' AND column_name = 'workflow_definition_json';
+-- Expected: 0 rows. If 1 row returned → run: ALTER TABLE agent_configs DROP COLUMN workflow_definition_json;
+
+-- Correction 3: agent_configs.rag_enabled default must be true
+SELECT column_default FROM information_schema.columns
+WHERE table_name = 'agent_configs' AND column_name = 'rag_enabled';
+-- Expected: 'true'. If 'false' → run: ALTER TABLE agent_configs ALTER COLUMN rag_enabled SET DEFAULT true;
+EOF
+```
+
+---
+
+#### Step 4A.4 — Apply migration and verify
+
+```bash
+PG_PASS=$(vault kv get -field=app_password secret/trustnow/platform/postgres)
+
+# Apply migration (idempotent — safe to run even if some tables already exist)
+psql "postgresql://trustnow_app:$PG_PASS@127.0.0.1:5433/trustnow_platform" \
+  -f /opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api/src/database/migrations/002_cobrowsing_additions.sql \
+  2>&1 | tee /tmp/migration_002.log
+
+# Verify all 28 tables now exist
+psql "postgresql://trustnow_app:$PG_PASS@127.0.0.1:5433/trustnow_platform" -c "
+SELECT COUNT(*) AS total_tables FROM information_schema.tables WHERE table_schema = 'public';"
+# Expected: ≥ 47 tables (19 original + 28 new)
+```
+
+**✅ Addendum 4A complete when:** Migration runs with no ERROR lines in `/tmp/migration_002.log` and table count ≥ 47.
+
+---
+
+---
+
+### ADDENDUM 5A — AI Pipeline Backfill (Two New Services)
+
+**Objective:** Add `resolveEnvVars()` and the PII Redaction service to the FastAPI AI pipeline. Both are required before any BPO client deployment.
+
+---
+
+#### Step 5A.1 — Add `resolveEnvVars()` resolution service
+
+**File:** `services/ai-pipeline/src/env_var_service.py` (new file)
+
+```python
+# env_var_service.py
+# Resolves {{env.VAR_NAME}} tokens in agent config text fields at conversation start.
+# Called from: system_prompt resolution, first_message resolution,
+#              tool webhook URL/header resolution, MCP server_url resolution.
+
+import re
+import asyncpg
+from typing import Optional
+
+ENV_VAR_PATTERN = re.compile(r'\{\{env\.([A-Za-z][A-Za-z0-9_]*)\}\}')
+
+
+async def resolve_env_vars(
+    text: str,
+    tenant_id: str,
+    environment: str,   # 'production' | 'staging' | 'development' | custom
+    db_pool: asyncpg.Pool
+) -> str:
+    """
+    Replace all {{env.VAR_NAME}} tokens in text with their resolved values.
+    Falls back to production value if no override exists for the current environment.
+    Raises ValueError if a referenced variable has no production value.
+    """
+    tokens = ENV_VAR_PATTERN.findall(text)
+    if not tokens:
+        return text
+
+    async with db_pool.acquire() as conn:
+        for var_name in set(tokens):  # deduplicate
+            # Look up variable
+            var = await conn.fetchrow(
+                "SELECT var_id FROM environment_variables "
+                "WHERE tenant_id = $1 AND name = $2",
+                tenant_id, var_name
+            )
+            if not var:
+                raise ValueError(f"Environment variable '{var_name}' not found for tenant {tenant_id}")
+
+            # Try current environment first, fall back to production
+            value_row = await conn.fetchrow(
+                "SELECT value FROM environment_variable_values "
+                "WHERE var_id = $1 AND environment = $2",
+                var['var_id'], environment
+            )
+            if not value_row:
+                value_row = await conn.fetchrow(
+                    "SELECT value FROM environment_variable_values "
+                    "WHERE var_id = $1 AND environment = 'production'",
+                    var['var_id']
+                )
+            if not value_row:
+                raise ValueError(
+                    f"Variable '{var_name}' has no value for environment "
+                    f"'{environment}' and no production fallback."
+                )
+
+            text = text.replace(f'{{{{env.{var_name}}}}}', value_row['value'])
+
+    return text
+```
+
+**Wire into `main.py`:** At conversation initiation (before first LLM call), resolve env vars in:
+- `agent_configs.system_prompt`
+- `agent_configs.first_message`
+- Each tool's `url` and `headers` values
+- Each MCP server's `server_url`
+
+```python
+# In session_init() or equivalent in main.py, after loading agent_configs:
+from env_var_service import resolve_env_vars
+
+environment = agent_configs.get('environment', 'production')
+system_prompt = await resolve_env_vars(
+    agent_configs['system_prompt'], tenant_id, environment, db_pool
+)
+first_message = await resolve_env_vars(
+    agent_configs['first_message'], tenant_id, environment, db_pool
+)
+# Repeat for each tool URL/header and each MCP server_url
+```
+
+---
+
+#### Step 5A.2 — Add PII Redaction service
+
+**File:** `services/ai-pipeline/src/pii_redaction_service.py` (new file)
+
+```python
+# pii_redaction_service.py
+# Redacts PII from transcript text before storage.
+# Called AFTER conversation_turns is populated, BEFORE writing to conversations.transcript_json.
+# Only active when agent_configs.pii_redaction_enabled = True.
+
+import re
+from typing import Any
+
+# PII patterns — extend as required for regional compliance (TRAI, GDPR, TCPA)
+PII_PATTERNS = [
+    # UK/IN mobile numbers: +447xxx or 07xxx or +919xxx
+    (re.compile(r'\b(\+44|0)7\d{9}\b'), '[PHONE_NUMBER]'),
+    (re.compile(r'\b(\+91)?[6-9]\d{9}\b'), '[PHONE_NUMBER]'),
+    # Generic international E.164
+    (re.compile(r'\+[1-9]\d{6,14}\b'), '[PHONE_NUMBER]'),
+    # Payment card numbers (16-digit, with or without spaces/dashes)
+    (re.compile(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b'), '[CARD_NUMBER]'),
+    # UK National Insurance
+    (re.compile(r'\b[A-Z]{2}\d{6}[A-D]\b', re.IGNORECASE), '[NI_NUMBER]'),
+    # Date of birth patterns: DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD
+    (re.compile(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\b'), '[DOB]'),
+    (re.compile(r'\b\d{4}[/\-]\d{1,2}[/\-]\d{1,2}\b'), '[DOB]'),
+    # Sort codes (UK banking): 12-34-56
+    (re.compile(r'\b\d{2}[\-]\d{2}[\-]\d{2}\b'), '[SORT_CODE]'),
+    # Bank account numbers (UK: 8 digits)
+    (re.compile(r'\b\d{8}\b'), '[ACCOUNT_NUMBER]'),
+    # Email addresses
+    (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b'), '[EMAIL]'),
+]
+
+
+def redact_pii(text: str) -> str:
+    """Apply all PII patterns to a text string. Returns redacted version."""
+    for pattern, replacement in PII_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def redact_transcript_json(transcript_json: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Redact PII from all text fields in a conversation turns array.
+    transcript_json is a list of {speaker, text, ...} objects.
+    Returns a new list with text fields redacted — does not mutate input.
+    """
+    redacted = []
+    for turn in transcript_json:
+        turn_copy = dict(turn)
+        if 'text' in turn_copy and turn_copy['text']:
+            turn_copy['text'] = redact_pii(turn_copy['text'])
+        redacted.append(turn_copy)
+    return redacted
+```
+
+**Wire into conversation storage pipeline in `main.py`:**
+
+```python
+# In session_end_handler() or wherever transcript is written to DB:
+from pii_redaction_service import redact_transcript_json
+
+if agent_configs.get('pii_redaction_enabled', False):
+    transcript_json = redact_transcript_json(transcript_json)
+    # plain_text for stt_transcripts also needs redaction if present
+```
+
+---
+
+#### Step 5A.3 — Restart AI pipeline and smoke test
+
+```bash
+# Restart FastAPI service
+cd /opt/trustnowailabs/trustnow-ai-worker-stack
+docker compose restart ai-pipeline   # or: sudo systemctl restart trustnow-ai-pipeline
+
+# Wait for startup
+sleep 5
+
+# Smoke test: env var resolution (unit test)
+python3 << 'EOF'
+import asyncio
+import asyncpg
+import os
+
+async def test_resolve():
+    # Simple pattern-only test (no DB needed for syntax check)
+    import sys
+    sys.path.insert(0, 'services/ai-pipeline/src')
+    from env_var_service import ENV_VAR_PATTERN
+    tokens = ENV_VAR_PATTERN.findall("Hello {{env.MY_API_URL}} and {{env.CRM_TOKEN}}")
+    assert tokens == ['MY_API_URL', 'CRM_TOKEN'], f"Pattern test failed: {tokens}"
+    print("✅ env_var_service: pattern matching OK")
+
+asyncio.run(test_resolve())
+EOF
+
+# Smoke test: PII redaction
+python3 << 'EOF'
+import sys
+sys.path.insert(0, 'services/ai-pipeline/src')
+from pii_redaction_service import redact_pii
+
+result = redact_pii("My phone is 07912345678 and my card is 4111 1111 1111 1111")
+assert '[PHONE_NUMBER]' in result, "Phone not redacted"
+assert '[CARD_NUMBER]' in result, "Card not redacted"
+assert '07912345678' not in result, "Raw phone still present"
+print(f"✅ pii_redaction_service: redaction OK → {result}")
+EOF
+```
+
+**✅ Addendum 5A complete when:** Both smoke tests print ✅ and the AI pipeline container is running (`docker compose ps | grep ai-pipeline`).
+
+---
+
+---
+
+### ADDENDUM 6A — NestJS Platform API: 21 New Modules
+
+**Objective:** Build all 21 new NestJS endpoint modules added during the co-browsing translation (§6.2D through §6.2X). These are the APIs that Task 8 frontend will call.
+
+---
+
+#### Step 6A.0 — Updated execution sequence
+
+The Task 6 execution sequence previously referenced only §6.2A, §6.2B, §6.2C. Now read and implement ALL of the following in sequence. Each section in IMPL-001 is a complete contract — spec is written, implement it directly.
+
+```
+§6.2D — Agent Creation APIs (wizard + blank, two distinct paths)
+§6.2E — Agent Templates (seed 48 templates at Tier 1 launch)
+§6.2F — Additional AgentsModule (translate-first-message, soft gate count)
+§6.2G — WidgetModule (embed spec, CSAT, shareable page)
+§6.2H — AdvancedTab backend (PII cron, retention purge cron, 3 BullMQ jobs)
+§6.2I — SecurityModule (auth policies, guardrails, overrides, webhooks)
+§6.2J — ToolsModule (webhook/client/integration/MCP, system tool toggles)
+§6.2K — KnowledgeBaseModule (workspace-level docs, junction table, RAG config)
+§6.2L — AnalysisModule (post-call jobs: summary + criteria + data-extraction)
+§6.2M — PhoneNumbersModule (8-step SIP wizard, dialplan reload via ESL)
+§6.2N — BatchCallModule (BatchCallWorker, CSV pipeline, concurrency formula)
+§6.2O — WorkflowModule (node/edge CRUD, auto-save debounce, 4 template seeds)
+§6.2P — BranchesModule (traffic split invariant, protect/unlock, version restore)
+§6.2Q — TestsModule (3 test types, async execution, 5 template seeds)
+§6.2R — WhatsAppModule (Meta OAuth, webhook handler, inbound message pipeline)
+§6.2S — SettingsModule (workspace webhooks, secrets, auth connections)
+§6.2T — ApiKeysModule (key generation + SHA-256 hash, scope middleware)
+§6.2U — WebhookEndpointsModule (platform events, HMAC signing, retry delivery)
+§6.2V — EnvVarsModule (CRUD + resolveEnvVars() wired to AI pipeline)
+§6.2W — StandaloneTTSModule (generate, MinIO storage, history)
+§6.2X — AsyncSTTModule (Scribe v2 jobs via BullMQ, transcript library)
+```
+
+---
+
+#### Step 6A.1 — Module registration and package additions
+
+```bash
+cd /opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api
+
+# Add packages needed by new modules
+npm install @nestjs/bull bull crypto-js papaparse @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
+npm install nodemailer axios form-data
+npm install --save-dev @types/papaparse
+
+# Verify build still passes after installs
+npm run build 2>&1 | tail -20
+```
+
+---
+
+#### Step 6A.2 — Build modules in sequence
+
+Build each module by reading its spec section in IMPL-001. Follow the same NestJS pattern used for the 13 existing modules: `nest generate module`, `nest generate service`, `nest generate controller`. Each module's DTOs, service logic, and controller routes are fully specified in §6.2D through §6.2X.
+
+**Critical notes for specific modules:**
+
+**§6.2H — AdvancedTab / Post-Call Pipeline:**
+- The 3 BullMQ workers (`post-call-summary`, `post-call-criteria`, `post-call-data-extraction`) must be registered in `app.module.ts` as `BullModule.registerQueue(...)` entries.
+- The retention purge cron uses `@nestjs/schedule` — install if not already present: `npm install @nestjs/schedule`.
+- PII patterns live in `pii-redaction.service.ts` — same patterns as `pii_redaction_service.py` in Addendum 5A (single source of truth is the AI pipeline for storage-side; NestJS version applies to any API-side text processing).
+
+**§6.2N — BatchCallModule:**
+- `BatchCallWorker` is a **separate NestJS worker process** — not the main Platform API app. Create `services/platform-api/src/workers/batch-call.worker.ts` that bootstraps with only the `BullModule` and `BatchCallWorker` processor. K8s Deployment for this worker is documented in Task 3 addendum (see §7A below).
+- The FreeSWITCH ESL `originate` command in `BatchCallWorker.makeOutboundCall()` requires the outbound SIP gateway `trustnow_trunk` to be configured — this is done in Addendum 7A.
+
+**§6.2T — ApiKeysModule:**
+- The `validateApiKey()` middleware must be registered in `app.module.ts` as a global middleware: `consumer.apply(ApiKeyMiddleware).forRoutes('*')` with exclusion for Keycloak-JWT routes.
+- Key generation: `crypto.randomBytes(24).toString('base64url')` prefixed with `sk-tn_`.
+- Key hash: `crypto.createHash('sha256').update(rawKey).digest('hex')`.
+
+**§6.2R — WhatsAppModule:**
+- The `POST /whatsapp/webhook` endpoint must be **excluded from Keycloak JWT auth** — Meta calls it without a JWT. Use `@SkipAuth()` decorator or equivalent.
+- Signature verification: compare `X-Hub-Signature-256` header against `sha256=` + `HMAC-SHA256(rawBody, appSecret)`. Use raw body — not parsed JSON.
+- This endpoint must return HTTP 200 within 5 seconds. All processing is async (BullMQ).
+
+**§6.2O — WorkflowModule:**
+- Auto-save: frontend debounces `PUT /agents/:id/workflow` by 2 seconds. The endpoint must do a full DELETE + re-INSERT of `workflow_nodes` and `workflow_edges` within a single DB transaction.
+- Seed 4 workflow templates from §6.2O template table into `workflow_templates` table (create this table in a supplementary migration if not already present).
+
+---
+
+#### Step 6A.3 — Register all new routes in Kong
+
+```bash
+KONG_ADMIN="http://127.0.0.1:8001"
+
+# For each new module route group, add Kong service + route.
+# Use the same pattern as the existing 13 modules.
+# Key new route groups to add:
+
+declare -A ROUTES=(
+  ["batch-calls"]="/batch-calls"
+  ["whatsapp"]="/whatsapp"
+  ["workspace-settings"]="/workspace"
+  ["api-keys"]="/api-keys"
+  ["webhooks-platform"]="/api/webhooks"
+  ["env-vars"]="/env-vars"
+  ["tts-standalone"]="/tts"
+  ["stt-standalone"]="/stt"
+  ["phone-numbers"]="/phone-numbers"
+  ["workflow"]="/agents/{agent_id}/workflow"
+  ["branches"]="/agents/{agent_id}/branches"
+  ["tests"]="/tests"
+  ["conversations-global"]="/conversations"
+)
+
+for name in "${!ROUTES[@]}"; do
+  curl -s -X POST "$KONG_ADMIN/services" \
+    --data "name=$name" \
+    --data "url=http://127.0.0.1:3001"
+  curl -s -X POST "$KONG_ADMIN/services/$name/routes" \
+    --data "paths[]=${ROUTES[$name]}"
+  echo "✅ Registered: $name → ${ROUTES[$name]}"
+done
+```
+
+---
+
+#### Step 6A.4 — Verification
+
+```bash
+# Build
+cd /opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api
+npm run build 2>&1 | grep -E "error|Error|ERROR" | head -20
+# Expected: 0 errors
+
+# Restart NestJS
+pm2 restart platform-api || sudo systemctl restart trustnow-platform-api
+
+# Wait for startup
+sleep 8
+
+# Smoke test every new module (one representative endpoint each)
+BASE="http://127.0.0.1:3001"
+TOKEN=$(curl -s -X POST http://127.0.0.1:8080/realms/trustnow_dev/protocol/openid-connect/token \
+  -d "grant_type=password&client_id=trustnow-platform&username=admin@trustnow.ai&password=$(vault kv get -field=password secret/trustnow/platform/keycloak_admin)" \
+  | jq -r '.access_token')
+
+declare -a ENDPOINTS=(
+  "GET /batch-calls"
+  "GET /whatsapp/accounts"
+  "GET /workspace/settings"
+  "GET /api-keys"
+  "GET /api/webhooks"
+  "GET /env-vars"
+  "GET /tts/history"
+  "GET /stt/transcripts"
+  "GET /phone-numbers"
+  "GET /tests"
+  "GET /conversations"
+)
+
+for ep in "${ENDPOINTS[@]}"; do
+  METHOD=$(echo $ep | cut -d' ' -f1)
+  PATH=$(echo $ep | cut -d' ' -f2)
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X $METHOD "$BASE$PATH" \
+    -H "Authorization: Bearer $TOKEN")
+  echo "$STATUS — $METHOD $PATH"
+done
+# Expected: all 200 (or 404 if empty data — but not 500 or connection refused)
+```
+
+**✅ Addendum 6A complete when:** Build produces 0 errors, PM2/systemd shows platform-api running, and all smoke test endpoints return 200 or 404 (not 500).
+
+---
+
+---
+
+### ADDENDUM 7A — FreeSWITCH Outbound SIP Gateway
+
+**Objective:** Configure the FreeSWITCH outbound SIP gateway (`trustnow_trunk`) required by the BatchCallWorker's `originate sofia/gateway/trustnow_trunk/+E164` command. Without this, Addendum 6A batch calling will fail at the FreeSWITCH layer.
+
+**Context:** Task 7 configured inbound SIP. The co-browsing translation (§6.2N BatchCallModule) requires an outbound gateway. The gateway configuration is dynamically updated by PhoneNumbersModule when a client imports a SIP trunk number. This addendum implements the static framework; the dynamic per-tenant gateway is wired by §6.2M.
+
+---
+
+#### Step 7A.1 — Add Sofia outbound SIP profile gateway template
+
+```bash
+ROOT=/opt/trustnowailabs/trustnow-ai-worker-stack
+FSDIR=$ROOT/config/freeswitch
+
+# Create an outbound gateway directory for dynamic per-tenant gateways
+mkdir -p $FSDIR/sip_profiles/external
+
+# Create the external Sofia SIP profile that loads gateway configs
+cat > $FSDIR/sip_profiles/external.xml << 'EOF'
+<profile name="external">
+  <settings>
+    <param name="debug" value="0"/>
+    <param name="sip-trace" value="no"/>
+    <param name="context" value="public"/>
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="rtp-hold-timeout-sec" value="1800"/>
+    <param name="dtmf-duration" value="2000"/>
+    <param name="codec-prefs" value="$${global_codec_prefs}"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="nonce-ttl" value="60"/>
+    <param name="auth-calls" value="false"/>
+    <param name="inbound-late-negotiation" value="true"/>
+    <param name="apply-nat-acl" value="nat.auto"/>
+    <param name="rtp-start-port" value="16384"/>
+    <param name="rtp-end-port" value="32768"/>
+    <param name="tls" value="false"/>
+    <param name="pass-callee-id" value="true"/>
+  </settings>
+  <gateways>
+    <!-- Dynamic gateways are loaded from sip_profiles/external/*.xml -->
+    <!-- Created by PhoneNumbersModule (§6.2M) when a SIP trunk is imported -->
+    <!-- Manually add a test gateway here for verification: -->
+    <!--
+    <gateway name="trustnow_trunk_test">
+      <param name="username" value="REPLACE_WITH_SIP_USER"/>
+      <param name="password" value="REPLACE_WITH_SIP_PASSWORD"/>
+      <param name="proxy" value="REPLACE_WITH_SIP_PROVIDER_HOST"/>
+      <param name="register" value="true"/>
+      <param name="caller-id-in-from" value="true"/>
+    </gateway>
+    -->
+  </gateways>
+</profile>
+EOF
+
+echo "External SIP profile created."
+```
+
+---
+
+#### Step 7A.2 — Wire PhoneNumbersModule to create gateway configs via ESL
+
+In `PhoneNumbersModule` (`§6.2M`), the `POST /phone-numbers` and `PUT /phone-numbers/:id/assign-agent` handlers already call `api reloadxml` via ESL. Extend them to also write a gateway config file before reloading:
+
+```typescript
+// In phone-numbers.service.ts — called when a phone number is created/updated
+
+async upsertFreeSwitchGateway(phoneNumber: PhoneNumber): Promise<void> {
+  const gatewayName = `trustnow_tenant_${phoneNumber.tenant_id.replace(/-/g, '_').substring(0, 8)}`;
+  const gatewayPath = `/opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch/sip_profiles/external/${gatewayName}.xml`;
+
+  const gatewayXml = `<include>
+  <gateway name="${gatewayName}">
+    <param name="username" value="${phoneNumber.sip_username ?? ''}"/>
+    <param name="password" value="${await this.vaultService.getSecret(`trustnow/${phoneNumber.tenant_id}/sip/${phoneNumber.phone_number_id}`)}"/>
+    <param name="proxy" value="${phoneNumber.outbound_address}"/>
+    <param name="register" value="${phoneNumber.sip_username ? 'true' : 'false'}"/>
+    <param name="transport" value="${phoneNumber.outbound_transport}"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>`;
+
+  require('fs').writeFileSync(gatewayPath, gatewayXml);
+  await this.eslService.sendApiCommand('reloadxml');
+  await this.eslService.sendApiCommand(`sofia profile external rescan`);
+}
+```
+
+---
+
+#### Step 7A.3 — Verification
+
+```bash
+# Verify external profile is loaded by FreeSWITCH
+docker exec $(docker ps -q --filter name=freeswitch) \
+  fs_cli -x "sofia status" | grep -i external
+# Expected: external profile listed
+
+# Verify ESL can trigger a gateway rescan
+docker exec $(docker ps -q --filter name=freeswitch) \
+  fs_cli -x "sofia profile external rescan"
+# Expected: "+OK reloading XML"
+
+# Verify an originate command is syntactically accepted (will fail at network level — that is expected)
+docker exec $(docker ps -q --filter name=freeswitch) \
+  fs_cli -x "originate sofia/gateway/trustnow_trunk_test/+12025550001 &echo"
+# Expected: any error except "INVALID_PROFILE" — "NO_ROUTE_DESTINATION" or "NORMAL_TEMPORARY_FAILURE" is acceptable
+# (gateway config is correct even if no actual SIP trunk is registered yet)
+```
+
+**✅ Addendum 7A complete when:** `sofia status` shows external profile loaded, `reloadxml` returns +OK, and originate does not return `INVALID_PROFILE`.
+
+---
+
+---
+
+### ADDENDUM COMPLETION CHECKLIST
+
+Before marking Task Addendum complete and moving to Task 8, verify every item:
+
+| # | Item | Verification |
+|---|------|-------------|
+| 4A-1 | Migration 002 applied with 0 errors | Check `/tmp/migration_002.log` — grep "ERROR" returns 0 lines |
+| 4A-2 | All 28 new tables present in DB | `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'` ≥ 47 |
+| 4A-3 | `knowledge_base_docs` has no `agent_id` column | Query returns 0 rows |
+| 4A-4 | `agent_configs` has no `workflow_definition_json` column | Query returns 0 rows |
+| 4A-5 | `rag_enabled` default is `true` | Query returns 'true' |
+| 5A-1 | `env_var_service.py` deployed + smoke test passes | Prints ✅ env_var_service: pattern matching OK |
+| 5A-2 | `pii_redaction_service.py` deployed + smoke test passes | Prints ✅ pii_redaction_service: redaction OK |
+| 5A-3 | AI pipeline container restarted and healthy | `docker compose ps ai-pipeline` shows Up |
+| 6A-1 | New npm packages installed + build passes 0 errors | `npm run build` output |
+| 6A-2 | All 21 modules (§6.2D–§6.2X) implemented and registered in app.module.ts | Code review + `grep -r 'Module' src/app.module.ts` |
+| 6A-3 | All new Kong routes registered | Endpoint smoke tests return 200/404, no 500 |
+| 6A-4 | BatchCallWorker process created as separate worker | `services/platform-api/src/workers/batch-call.worker.ts` exists |
+| 6A-5 | ApiKeyMiddleware registered globally | `POST /agents` with an api-key header but no JWT returns 401 (not 500) |
+| 7A-1 | `sip_profiles/external.xml` created | `cat $ROOT/config/freeswitch/sip_profiles/external.xml` |
+| 7A-2 | FreeSWITCH external profile loaded | `sofia status` shows external profile |
+| 7A-3 | `upsertFreeSwitchGateway()` in PhoneNumbersService | Code present in `phone-numbers.service.ts` |
+
+**Update RUNBOOK.md:** Mark Task Addendum COMPLETE, then report back to Master Architect. Do NOT start Task 8 until the full checklist above is confirmed.
+
+---
 
 ---
 
 ### ▶ PLATFORM ENGINEER — SESSION START INSTRUCTIONS FOR TASK 8
 
-Read RUNBOOK.md and confirm Tasks 5, 6, and 7 are COMPLETE before starting. Task 8 is the first major frontend task. Read `UI-SPEC-001.md §6.4 (Agent Config Module)` IN FULL before writing a single component — every field, every tab, every toggle is specified there with exact labels, defaults, and behaviour. Also read `UI-SPEC-001.md §6.1` (global layout/sidebar), `§6.3` (Agent List), `§6.5` (Voice Picker), `§6.6` (Voice Library), `§6.7` (KB page), `§6.8` (Tools page). Build to the spec — do not guess field names or layouts.
+Read RUNBOOK.md and confirm **Task Addendum is marked COMPLETE** (not just Tasks 5, 6, 7) before starting. Task Addendum delivers 21 new API modules and the schema backfill that every Task 8 component will call — do not start without it. Then read `UI-SPEC-001.md §6.4 (Agent Config Module)` IN FULL before writing a single component — every field, every tab, every toggle is specified there with exact labels, defaults, and behaviour. Also read `UI-SPEC-001.md §6.1` (global layout/sidebar), `§6.3` (Agent List), `§6.5` (Voice Picker), `§6.6` (Voice Library), `§6.7` (KB page), `§6.8` (Tools page). Build to the spec — do not guess field names or layouts.
 
 **CRITICAL — read before writing any frontend code:**
 - `UI-SPEC-001.md §6.4` tabs 1–10: every co-browsing observation is captured there. Tab 1 alone has ~40 fields.
@@ -4161,7 +8771,7 @@ Read RUNBOOK.md and confirm Tasks 5, 6, and 7 are COMPLETE before starting. Task
 
 After all verifications pass — update RUNBOOK.md. Then report back to Architect.
 
-**Prerequisite: Tasks 5, 6, and 7 complete.**
+**Prerequisite: Task Addendum complete (Tasks 4A + 5A + 6A + 7A all verified).**
 
 ---
 
@@ -4226,54 +8836,518 @@ On model selection — opens sub-panel:
 
 **Prerequisite: Task 8 complete.**
 
-### 9.1 — Conversational Agent Runtime
-Turn loop: STT (Deepgram/FasterWhisper) → RAG retrieval (optional) → LLM (LiteLLM) → TTS (ElevenLabs/Piper) → audio output to caller
+---
 
-- Session initiation: CID generated atomically (Redis + PostgreSQL + Kafka)
-- Each turn: cost recorded to Redis session, published to Kafka
-- Session end: Redis → PostgreSQL flush, recording finalised, `call_ended` Kafka event
-- All N concurrent sessions isolated per BRD-CC-003 (no shared state)
+### ▶ PLATFORM ENGINEER — CO-BROWSE FINDINGS: READ BEFORE WRITING ANY TURN LOOP CODE
 
-### 9.2 — Barge-In / Interrupt Policy (GAPS-DOC: must-not-miss for Conversational Agents)
+A live voice call was conducted on the TRUSTNOW ElevenLabs account (28 March 2026, 4:22 duration, 28 messages). The following requirements are derived directly from observed behaviour and MUST be implemented exactly as specified here. Do not deviate.
 
-When a caller speaks while the TTS audio is playing, the system must handle the interruption cleanly. This policy must be implemented in the AI pipeline turn loop and is configurable per agent via Tab 10 Advanced.
+**Live latency measurements observed:**
+| Turn type | LLM latency | TTS latency | ASR latency |
+|-----------|------------|------------|------------|
+| First message (no LLM) | — | 261 ms | — |
+| Short agent turn | 431–652 ms | 104–184 ms | — |
+| Long agent turn | 2.0 s | 104–173 ms | — |
+| User turn (ASR) | — | — | 120–234 ms |
 
-**Interrupt modes (configurable per agent):**
-- `allow` — any caller speech immediately stops TTS playback, STT begins capturing
-- `smart` — only stop TTS if caller speech exceeds 300ms (filters out short affirmative sounds like "uh-huh", "yes" that should not interrupt)
-- `none` — TTS plays to completion before STT activates (use for formal compliance scripts)
+**Barge-in confirmed live:** User said "wait, wait, wait, let me interrupt you" mid-agent TTS. Agent stopped immediately. Interrupted turn committed as truncated. New STT began. LLM responded to new input with full topic switch — zero residue from interrupted response.
 
-**Implementation requirements:**
-- FreeSWITCH ESL event `DETECTED_SPEECH` triggers interrupt signal to AI pipeline via Redis pub/sub `interrupt:{CID}`
-- AI pipeline subscribes to interrupt channel per active CID — on interrupt: stop TTS stream, discard remaining audio buffer, begin new STT capture
-- Interrupted TTS turn is logged in transcript as `[interrupted]` marker with timestamp
-- Caller speech captured from interrupt point — LLM receives truncated previous AI turn + full caller utterance
+**Agent cannot self-terminate:** The agent told the caller "I am an AI agent, so there isn't a traditional call to disconnect. You can simply close your browser window." This confirms: **the LLM must NEVER attempt to end the call via conversation text.** Call termination must be triggered exclusively by the platform (FreeSWITCH ESL signal) based on: max duration timer, silence timeout exhaustion, or explicit handoff. The platform engineer must implement `platform_end_call(cid, reason)` as a separate ESL-driven function completely independent of the LLM response path.
 
-### 9.3 — Voice Activity Detection (VAD) Parameters (GAPS-DOC: must-not-miss)
+---
 
-VAD governs when the system considers the caller has finished speaking and the AI's turn begins. These must be configurable per agent (Tab 10 Advanced) with the following locked defaults:
+### §9.1 — Conversational Agent Runtime — Complete Turn Loop
+
+**Two distinct code paths — first message vs conversation turns:**
+
+#### Path 1 — Session Start / First Message (NO LLM CALL)
+
+The first message is pre-configured text. It MUST NOT go through the LLM. It is synthesised directly to TTS at session connect — this is why the first-message TTS latency (261ms) is lower than any subsequent agent turn.
+
+```python
+# In session_manager.py — called on CHANNEL_ANSWER ESL event
+async def start_session(cid: str, agent_config: dict, channel_uuid: str):
+    """
+    Called immediately when FreeSWITCH CHANNEL_ANSWER fires.
+    Generates CID, starts recording, plays first message via TTS only (no LLM).
+    """
+    t_start = time.monotonic()
+
+    # 1. Store session state in Redis
+    await redis.hset(f"session:{cid}", mapping={
+        "agent_id": agent_config["agent_id"],
+        "tenant_id": agent_config["tenant_id"],
+        "channel_uuid": channel_uuid,
+        "partition": agent_config["partition"],  # A or B
+        "language": agent_config["language"],
+        "started_at": datetime.utcnow().isoformat(),
+        "turn_count": 0,
+        "llm_cost_usd": 0.0,
+        "transcript": json.dumps([]),
+        "silence_tier": 0,  # tracks which silence re-prompt tier we are on
+    })
+    await redis.expire(f"session:{cid}", 7200)  # 2h max session
+
+    # 2. Synthesise first_message via TTS — NO LLM CALL
+    first_message = agent_config.get("first_message", "")
+    if not first_message:
+        # If no first_message configured: wait for caller to speak first
+        await set_listening_state(cid)
+        return
+
+    t_tts_start = time.monotonic()
+    audio_chunks = await tts_adapter.synthesise(
+        text=first_message,
+        voice_id=agent_config["voice_id"],
+        partition=agent_config["partition"],
+        output_format="ulaw_8000" if agent_config["channel"] == "sip" else "pcm_16000",
+    )
+    tts_latency_ms = int((time.monotonic() - t_tts_start) * 1000)
+
+    # 3. Stream audio to caller via LiveKit / FreeSWITCH
+    await stream_audio_to_caller(cid, channel_uuid, audio_chunks, agent_config["partition"])
+
+    # 4. Append first message to transcript (no LLM or ASR latency for this turn)
+    await append_transcript_turn(cid, {
+        "role": "agent",
+        "text": first_message,
+        "timestamp_s": 0.0,
+        "tts_latency_ms": tts_latency_ms,
+        "llm_latency_ms": None,   # no LLM on first message
+        "asr_latency_ms": None,
+        "interrupted": False,
+    })
+
+    # 5. Start silence timeout watchdog — begins counting from end of first message
+    await start_silence_watchdog(cid, agent_config)
+
+    # 6. Enter listening state
+    await set_listening_state(cid)
+```
+
+#### Path 2 — Conversation Turn Loop (STT → LLM → TTS)
+
+Every subsequent turn after the first message follows this pipeline:
+
+```python
+# In turn_loop.py — main conversation turn handler
+async def handle_user_turn(cid: str, audio_bytes: bytes, agent_config: dict):
+    """
+    Called when VAD confirms end-of-speech.
+    Implements: STT → RAG (optional) → LLM → TTS → audio output
+    Records latency for every stage.
+    Publishes real-time transcript update to Redis pub/sub for frontend streaming.
+    """
+    session = await redis.hgetall(f"session:{cid}")
+    turn_number = int(session.get("turn_count", 0)) + 1
+    turn_start_ts = await get_elapsed_seconds(cid)
+
+    # ── STAGE 1: ASR (Speech-to-Text) ────────────────────────────────────────
+    t_asr_start = time.monotonic()
+    transcript_text = await stt_adapter.transcribe(
+        audio=audio_bytes,
+        partition=agent_config["partition"],
+        language=agent_config["language"],
+    )
+    asr_latency_ms = int((time.monotonic() - t_asr_start) * 1000)
+
+    if not transcript_text.strip():
+        # Empty transcription — treat as silence, reset watchdog
+        await reset_silence_watchdog(cid, agent_config)
+        return
+
+    # Append user turn to transcript immediately (real-time streaming to frontend)
+    await append_transcript_turn(cid, {
+        "role": "user",
+        "text": transcript_text,
+        "timestamp_s": turn_start_ts,
+        "asr_latency_ms": asr_latency_ms,
+        "llm_latency_ms": None,
+        "tts_latency_ms": None,
+        "interrupted": False,
+    })
+    # Publish to Redis for real-time transcript streaming to frontend widget
+    await redis.publish(f"transcript:{cid}", json.dumps({
+        "role": "user", "text": transcript_text, "asr_latency_ms": asr_latency_ms
+    }))
+
+    # Reset silence watchdog — user spoke, restart the timer
+    await reset_silence_watchdog(cid, agent_config)
+    # Reset silence re-prompt tier counter
+    await redis.hset(f"session:{cid}", "silence_tier", 0)
+
+    # ── STAGE 2: RAG Retrieval (optional) ────────────────────────────────────
+    rag_context = ""
+    if agent_config.get("rag_enabled") and agent_config.get("kb_docs_attached"):
+        rag_context = await rag_pipeline.retrieve(
+            query=transcript_text,
+            tenant_id=agent_config["tenant_id"],
+            agent_id=agent_config["agent_id"],
+            top_k=agent_config.get("rag_top_k", 5),
+        )
+
+    # ── STAGE 3: LLM Completion ───────────────────────────────────────────────
+    full_transcript = json.loads(session.get("transcript", "[]"))
+    messages = build_llm_messages(
+        system_prompt=agent_config["system_prompt"],
+        transcript=full_transcript,
+        rag_context=rag_context,
+    )
+
+    t_llm_start = time.monotonic()
+    llm_response = await llm_complete(
+        messages=messages,
+        model=agent_config["llm_model"],
+        backup_model=agent_config.get("backup_llm_model"),
+        temperature=agent_config.get("llm_temperature", 0.7),
+        max_tokens=agent_config.get("llm_max_tokens", -1),
+        cid=cid,
+    )
+    llm_latency_ms = int((time.monotonic() - t_llm_start) * 1000)
+
+    # Check handoff conditions BEFORE generating TTS (§7.12 handoff_service.py)
+    from handoff_service import check_handoff_conditions
+    handoff_trigger = check_handoff_conditions(full_transcript + [{"user": transcript_text}], agent_config, session)
+    if handoff_trigger:
+        await execute_platform_handoff(cid, session, agent_config, handoff_trigger, full_transcript)
+        return
+
+    # ── STAGE 4: TTS Synthesis + Streaming ───────────────────────────────────
+    agent_turn_text = llm_response["text"]
+    t_tts_start = time.monotonic()
+
+    # Subscribe to barge-in interrupt channel BEFORE starting TTS stream
+    interrupt_sub = await redis.subscribe(f"interrupt:{cid}")
+
+    audio_completed = True
+    async for audio_chunk in tts_adapter.synthesise_stream(
+        text=agent_turn_text,
+        voice_id=agent_config["voice_id"],
+        partition=agent_config["partition"],
+        output_format="ulaw_8000" if agent_config["channel"] == "sip" else "pcm_16000",
+    ):
+        # Check for barge-in interrupt signal on every chunk
+        interrupt_signal = await interrupt_sub.get_nowait()
+        if interrupt_signal:
+            # Barge-in detected — stop TTS immediately
+            await stop_audio_stream(cid)
+            audio_completed = False
+            break
+        await stream_audio_chunk_to_caller(cid, audio_chunk)
+
+    tts_latency_ms = int((time.monotonic() - t_tts_start) * 1000)  # TTFA metric
+    await redis.unsubscribe(f"interrupt:{cid}")
+
+    # ── STAGE 5: Record turn to transcript ───────────────────────────────────
+    agent_turn = {
+        "role": "agent",
+        "text": agent_turn_text if audio_completed else agent_turn_text + " [interrupted]",
+        "timestamp_s": turn_start_ts,
+        "llm_latency_ms": llm_latency_ms,
+        "tts_latency_ms": tts_latency_ms,
+        "asr_latency_ms": None,
+        "interrupted": not audio_completed,
+    }
+    await append_transcript_turn(cid, agent_turn)
+
+    # Publish agent turn to Redis for real-time frontend streaming
+    await redis.publish(f"transcript:{cid}", json.dumps({
+        "role": "agent",
+        "text": agent_turn_text,
+        "llm_latency_ms": llm_latency_ms,
+        "tts_latency_ms": tts_latency_ms,
+        "streaming": not audio_completed,  # True while TTS is still playing
+    }))
+
+    # ── STAGE 6: Cost recording ───────────────────────────────────────────────
+    llm_cost = llm_response.get("cost_usd", 0.0)
+    await redis.hincrbyfloat(f"session:{cid}", "llm_cost_usd", llm_cost)
+    await redis.hincrby(f"session:{cid}", "turn_count", 1)
+    await redis.hincrby(f"session:{cid}", "llm_turns", 1)
+
+    # ── STAGE 7: Back to listening ────────────────────────────────────────────
+    if audio_completed:
+        await start_silence_watchdog(cid, agent_config)
+    # If interrupted, new user turn already in progress — watchdog not needed
+```
+
+---
+
+### §9.2 — Barge-In / Interrupt Policy (Confirmed Live — Co-Browse 28 Mar 2026)
+
+**Observed behaviour:** Caller interrupted mid-agent-TTS twice during the live call. In both cases:
+1. TTS stopped within one audio chunk of the DETECTED_SPEECH event (sub-200ms perceived response)
+2. The partial agent response was committed to transcript with `[interrupted]` marker
+3. The LLM context for the next turn included the truncated agent response — the LLM does NOT retry the interrupted response; it processes the new user input as-is
+4. Language context and conversation flow continued cleanly after interruption
+
+**Interrupt modes (configurable per agent — Tab 10 Advanced):**
+- `allow` — any caller speech immediately stops TTS playback, STT begins capturing (default)
+- `smart` — only stop TTS if caller speech exceeds 300ms (filters short affirmatives like "uh-huh", "mm" that should not interrupt)
+- `none` — TTS plays to completion before STT activates (compliance scripts)
+
+**Implementation — barge-in signal chain:**
+
+```python
+# In esl_service.ts — DETECTED_SPEECH event fires the interrupt signal
+if (message.includes('Event-Name: DETECTED_SPEECH')) {
+    const cid = this.extractHeader(message, 'variable_trustnow_cid');
+    const speechDuration = parseInt(this.extractHeader(message, 'Speech-Duration') || '0');
+    if (cid) {
+        // Publish to Redis — AI pipeline subscribes per active CID
+        await redisClient.publish(`interrupt:${cid}`, JSON.stringify({
+            speech_duration_ms: speechDuration,
+            timestamp: Date.now(),
+        }));
+        this.emit('DETECTED_SPEECH', { cid, speechDuration });
+    }
+}
+
+# In turn_loop.py — interrupt consumer (runs concurrently with TTS stream)
+async def barge_in_listener(cid: str, agent_config: dict) -> bool:
+    """Returns True if barge-in should stop TTS, False otherwise."""
+    interrupt_mode = agent_config.get("interrupt_sensitivity", "allow")
+    sub = await redis.subscribe(f"interrupt:{cid}")
+    signal = await sub.get(timeout=0.05)  # 50ms poll
+    if not signal:
+        return False
+    if interrupt_mode == "none":
+        return False
+    if interrupt_mode == "smart":
+        payload = json.loads(signal)
+        return payload.get("speech_duration_ms", 0) >= 300
+    return True  # "allow" mode — any speech = interrupt
+```
+
+---
+
+### §9.3 — Silence Re-Prompt System (Multi-Tier — Confirmed Live)
+
+**Observed live:** When caller is silent, ElevenLabs fires 3 distinct re-prompt tiers before ending the call. Each tier is a full LLM → TTS turn. TRUSTNOW must implement identical behaviour.
+
+**3-tier silence re-prompt architecture:**
+
+```python
+# In silence_watchdog.py
+SILENCE_TIERS = [
+    {
+        "tier": 1,
+        "wait_s": 20,       # Observed: ~20s after first message before first re-prompt
+        "prompt": "The caller hasn't responded. Generate a brief, natural re-engagement question. Max 1 sentence.",
+    },
+    {
+        "tier": 2,
+        "wait_s": 25,       # Observed: ~25s after tier-1 re-prompt
+        "prompt": "Still no response. Generate a gentle acknowledgement that the caller may be busy, offer to continue when ready. Max 2 sentences.",
+    },
+    {
+        "tier": 3,
+        "wait_s": 20,       # Observed: ~20s after tier-2 re-prompt
+        "prompt": "Final attempt. Generate a brief farewell message indicating you'll be here when they're ready.",
+        "is_final": True,   # After tier 3: trigger platform_end_call()
+    },
+]
+
+async def silence_watchdog(cid: str, agent_config: dict):
+    """
+    Runs as a background asyncio task per session.
+    Fires LLM-generated re-prompts at configured silence intervals.
+    After final tier: triggers platform_end_call() via FreeSWITCH ESL.
+    Cancelled immediately when user speaks (reset_silence_watchdog called).
+    """
+    tier = int(await redis.hget(f"session:{cid}", "silence_tier") or 0)
+
+    for silence_config in SILENCE_TIERS[tier:]:
+        await asyncio.sleep(silence_config["wait_s"])
+
+        # Check if user spoke while we were sleeping (watchdog was reset)
+        current_tier = int(await redis.hget(f"session:{cid}", "silence_tier") or 0)
+        if current_tier != tier:
+            return  # User spoke — watchdog reset from outside, exit
+
+        # Generate re-prompt via LLM
+        session = await redis.hgetall(f"session:{cid}")
+        transcript = json.loads(session.get("transcript", "[]"))
+        re_prompt = await llm_complete_internal(silence_config["prompt"], transcript, agent_config)
+
+        # Play re-prompt via TTS
+        await play_agent_turn(cid, re_prompt, agent_config)
+
+        tier += 1
+        await redis.hset(f"session:{cid}", "silence_tier", tier)
+
+        if silence_config.get("is_final"):
+            # Final tier exhausted — end the call via platform (NOT via LLM text)
+            await platform_end_call(cid, reason="silence_timeout")
+            return
+
+async def platform_end_call(cid: str, reason: str = "agent_decision"):
+    """
+    Terminate the call via FreeSWITCH ESL.
+    This is the ONLY legitimate way for the platform to end a call.
+    The LLM must NEVER attempt to end a call through conversation text.
+    Reason values: silence_timeout | max_duration | handoff_complete | agent_decision
+    """
+    session = await redis.hgetall(f"session:{cid}")
+    channel_uuid = session.get("channel_uuid")
+
+    # Signal FreeSWITCH to hang up
+    esl_client.send(
+        f"sendmsg {channel_uuid}\n"
+        f"call-command: execute\n"
+        f"execute-app-name: hangup\n"
+        f"execute-app-arg: NORMAL_CLEARING\n\n"
+    )
+
+    # Record how_call_ended in Redis session (flushed to PostgreSQL at session end)
+    await redis.hset(f"session:{cid}", "how_call_ended", reason)
+
+    # Flush session to PostgreSQL
+    await session_manager.flush_session(cid)
+```
+
+**`how_call_ended` values (from live observation + BRD):**
+- `client_ended_call` — caller clicked hangup / closed browser (CHANNEL_HANGUP from caller side)
+- `silence_timeout` — 3-tier silence watchdog exhausted
+- `max_duration` — call exceeded `agent_config.max_duration_value` seconds
+- `agent_decision` — agent triggered end via `end_call` system tool (Tools-Assisted / Autonomous)
+- `handoff_complete` — Option B internal handoff accepted by human agent
+
+---
+
+### §9.4 — Voice Activity Detection (VAD) Parameters
+
+VAD governs when the system considers the caller has finished speaking. Configurable per agent in Tab 10 (Advanced tab). Live-observed default performance: ASR latency 120–234ms, confirming Deepgram Nova-2 (Partition A) operates well within the <200ms target for most turns.
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| End-of-speech silence | 800ms | 300–3000ms | Silence duration after which caller is considered done speaking |
-| Minimum speech duration | 100ms | 50–500ms | Minimum audio duration to be treated as intentional speech (filters clicks/noise) |
-| Noise floor threshold | -40dBFS | -60 to -20 | Below this level, audio treated as silence regardless of duration |
-| Max utterance duration | 60s | 10–300s | Maximum single caller utterance before forced end-of-speech |
-| STT start timeout | 10s | 5–60s | Silence at call start before playing re-prompt or timeout action |
+| End-of-speech silence | 800ms | 300–3000ms | Silence after which caller is considered done speaking |
+| Minimum speech duration | 100ms | 50–500ms | Minimum audio to be treated as intentional speech |
+| Noise floor threshold | -40dBFS | -60 to -20 | Below this = silence regardless of duration |
+| Max utterance duration | 60s | 10–300s | Maximum single caller utterance |
+| STT start timeout | 10s | 5–60s | Silence at call start before tier-1 silence re-prompt |
 
-**Implementation:** FasterWhisper (Partition B) uses `silero-vad` for endpoint detection. Deepgram (Partition A) uses Deepgram's built-in endpointing API with `endpointing` parameter set to the configured silence threshold in milliseconds.
+**Implementation:** Partition A (Deepgram): use `endpointing` parameter = configured silence threshold in ms. Partition B (FasterWhisper): use `silero-vad` with threshold mapped to configured values.
 
-### 9.4 — Latency vs Quality Presets (GAPS-DOC: must-not-miss)
+---
 
-Three first-class agent presets selectable per agent in Tab 1 (shown as a preset dropdown above the LLM picker):
+### §9.5 — Transcript JSON Schema Per Turn (Live-Confirmed)
 
-| Preset | LLM | STT | TTS | Use Case |
-|--------|-----|-----|-----|---------|
-| **Fast** | Fastest model in selected provider (e.g., gpt-4o-mini, claude-haiku) | `base` model (FasterWhisper) or Deepgram Nova-2 | Piper or ElevenLabs turbo | High-volume simple queries, IVR deflection |
-| **Balanced** | Mid-tier model (e.g., gpt-4o, gemini-flash) | `medium` model | ElevenLabs standard | Default for most contact centre deployments |
-| **High Quality** | Best model in selected provider (e.g., gpt-4o, claude-sonnet) | `large-v3` model | ElevenLabs multilingual v2 | Complex autonomous workflows, premium customer segments |
+Every turn in `conversations.transcript_json` MUST conform to this schema. Both `llm_latency_ms` and `tts_latency_ms` are required on agent turns. `asr_latency_ms` is required on user turns. These are displayed in the Analysis tab transcription view and the Preview screen.
 
-Selecting a preset auto-populates the LLM, STT, and TTS selectors in Tab 1 but the agent admin can override each individually after preset selection. The preset is stored as a metadata field in `agent_configs` alongside the individual selections.
+```python
+# Transcript turn schema — enforced on every append_transcript_turn() call
+AGENT_TURN_SCHEMA = {
+    "role": "agent",                # always "agent"
+    "text": str,                    # full response text (may end with " [interrupted]")
+    "timestamp_s": float,           # seconds from call start (M:SS displayed in UI)
+    "llm_latency_ms": int | None,   # None only for first_message (no LLM call)
+    "tts_latency_ms": int,          # always present; TTFA metric
+    "asr_latency_ms": None,         # always None for agent turns
+    "interrupted": bool,            # True if barge-in cut this turn short
+}
+
+USER_TURN_SCHEMA = {
+    "role": "user",
+    "text": str,                    # STT transcription
+    "timestamp_s": float,
+    "llm_latency_ms": None,         # always None for user turns
+    "tts_latency_ms": None,         # always None for user turns
+    "asr_latency_ms": int,          # STT transcription latency
+    "interrupted": False,           # users don't get interrupted
+}
+
+# LLM latency display rule (matching ElevenLabs UI behaviour observed live):
+# < 1000ms → display as "LLM 453 ms"
+# ≥ 1000ms → display as "LLM 2.0 s" (one decimal place in seconds)
+def format_latency_display(latency_ms: int) -> str:
+    if latency_ms < 1000:
+        return f"LLM {latency_ms} ms"
+    return f"LLM {latency_ms / 1000:.1f} s"
+```
+
+---
+
+### §9.6 — Real-Time Transcript Streaming (Live-Confirmed)
+
+The frontend receives transcript updates during the live call — not post-call. Every turn must be published to Redis pub/sub immediately. The frontend widget and the Preview screen both subscribe to this channel.
+
+```python
+# Redis channel: transcript:{cid}
+# Frontend subscribes via WebSocket (platform API proxies the Redis pub/sub)
+
+# Message format published on every turn:
+{
+    "event": "transcript_turn",
+    "cid": "cid_...",
+    "turn": {
+        "role": "agent" | "user",
+        "text": "...",                  # full text
+        "timestamp_s": 34.5,
+        "llm_latency_ms": 453,         # agent turns only
+        "tts_latency_ms": 106,         # agent turns only
+        "asr_latency_ms": 234,         # user turns only
+        "streaming": True,             # True while TTS still playing (shows "..." tail in UI)
+        "interrupted": False,
+    }
+}
+
+# When TTS finishes: publish streaming=False update to close the "..." tail
+{
+    "event": "transcript_turn_complete",
+    "cid": "cid_...",
+    "role": "agent",
+    "final_text": "...",               # complete text (same as during streaming usually)
+}
+```
+
+---
+
+### §9.7 — Text + Voice Simultaneous Mode (Live-Confirmed)
+
+During a live voice call, the text chat input is active and functional. Text messages submitted during a voice call are:
+1. Injected into the LLM context as a user turn (with `source: "text"` tag in transcript)
+2. The agent responds via TTS (not text-only)
+3. Both the text message and the voice response appear in the transcript
+
+The `conversations.text_only` flag (seen in Metadata panel: `Text-only: No`) indicates whether the session was purely text. A mixed session (voice + text) also sets `text_only = false`.
+
+---
+
+### §9.8 — Latency vs Quality Presets
+
+Three presets selectable per agent (Tab 1 dropdown above LLM picker):
+
+| Preset | LLM | STT | TTS | Target TTFA | Use Case |
+|--------|-----|-----|-----|------------|---------|
+| **Fast** | gpt-4o-mini / claude-haiku | FasterWhisper `base` or Deepgram Nova-2 | Piper or ElevenLabs turbo | <500ms | High-volume IVR deflection |
+| **Balanced** | gpt-4o / gemini-flash | FasterWhisper `medium` or Deepgram Nova-2 | ElevenLabs Flash v2.5 | <800ms | Standard contact centre (default) |
+| **High Quality** | claude-sonnet / gpt-4o | FasterWhisper `large-v3` or Deepgram Nova-3 | ElevenLabs Flash v2.5 multilingual | <1200ms | Complex autonomous workflows |
+
+Live-observed TTFA (Partition A, Balanced preset): **261ms first message, 106–184ms TTS on subsequent turns, 453–652ms LLM.** Total perceived latency per turn: ~600–900ms — within target.
+
+Preset auto-populates Tab 1 selectors; agent admin can override individually. Stored as `agent_configs.latency_preset` alongside individual selections.
+
+---
+
+### §9.9 — Speculative Turn (ElevenLabs Best Practice)
+
+When `agent_config.speculative_turn_enabled = true`, the AI pipeline begins generating an LLM response during silence — before end-of-speech is fully confirmed. If the caller stops speaking and the speculative response was correct, it is used. If the caller continues speaking, the speculative generation is discarded.
+
+```python
+# In turn loop — after VAD threshold approaching but before full confidence:
+if agent_config.speculative_turn_enabled and vad_confidence > 0.7:
+    speculative_task = asyncio.create_task(llm_complete(partial_transcript))
+    # If caller confirms end-of-speech → use speculative result
+    # If caller continues → cancel speculative_task
+```
+
+**Eagerness mapping to VAD thresholds:**
+| Eagerness | End-of-speech silence | Behaviour |
+|---|---|---|
+| `high` | 400ms | Very quick response — fast-paced interactions |
+| `normal` | 800ms | Balanced — standard contact centre (default) |
+| `low` | 1200ms | Agent waits longer — complex queries |
 
 ---
 
@@ -4397,7 +9471,9 @@ When building the visual workflow engine in Task 8, implement these node types m
 3. **Enterprise Tier Escalation** — Route enterprise users to priority support (Condition → Transfer to priority queue OR standard queue)
 4. **Business Hours Router** — Route to human agents during business hours only (Tool Call: check_business_hours → Condition → Conversation OR Transfer)
 
-Store workflow definition as JSONB in `agent_configs.workflow_definition_json` with schema: `{nodes: [{id, type, config, position}], edges: [{from, to, label}]}`
+  -- NOTE: workflow_definition_json JSONB removed — workflow is stored in dedicated
+  -- workflow_nodes + workflow_edges tables (confirmed §12.9). agent_configs.kb_docs_attached
+  -- and similar list fields remain as lightweight arrays.
 - Webhook: HTTP client with auth (API key/Bearer/OAuth2), configurable timeout, retry with backoff
 - Client-side tool: WebSocket message to frontend widget JavaScript
 - Integration connector: platform-managed connectors (CRM, ERP, ticketing)
@@ -4656,6 +9732,211 @@ File: `/app/page.tsx`
 - OTP flow end-to-end
 - ANI lookup
 - Custom webhook auth
+
+---
+
+### 16.7 — Agent Wizard → Live Call E2E (CO-BROWSING §1 + §7)
+
+Tests the complete guided creation path from wizard submission to a live conversation. Validates that the LLM-generated system prompt is correctly stored and used.
+
+**Steps:**
+1. `POST /agents/wizard` with `{agent_type: 'conversational', industry: 'healthcare_medical', use_case: 'telehealth_support', agent_name: 'Test Agent', main_goal: 'Help patients with appointment scheduling'}` → assert `agent_id` returned and `system_prompt` is non-empty (LLM generation ran)
+2. `POST /agents/:id/publish` → assert branch goes live
+3. Initiate a WebRTC test call to the published agent → assert conversation created with `agent_id` and `branch_id` correct
+4. Assert `conversations.system_prompt_used` (or equivalent) contains the wizard-generated prompt — NOT the blank default
+5. Assert `agents.creation_path = 'guided'` in DB
+
+**Validates:** §6.2D-B (wizard endpoint), agent_templates seed data, LLM generation service, publish flow, conversation creation
+
+---
+
+### 16.8 — Post-Call Background Jobs Pipeline E2E (CO-BROWSING §9)
+
+Tests that all 3 BullMQ post-call jobs fire and complete correctly after a call ends.
+
+**Steps:**
+1. Configure an agent with: 1 evaluation criterion + 1 data collection spec + `analysis_language = 'auto'`
+2. Complete a test call (via WebSocket test client) — call must have ≥ 3 turns
+3. Assert `how_call_ended` is set in `conversations`
+4. Wait up to 30 seconds for async jobs:
+   - Assert `conversations.ai_summary` is non-null and non-empty (Job 1: summary generation)
+   - Assert `conversations.evaluation_results` contains the criterion's UUID as a key (Job 2: criteria evaluation)
+   - Assert `conversations.data_collection_results` contains the spec's field_name as a key (Job 3: data extraction)
+5. Assert all 3 BullMQ queues (`post-call-summary`, `post-call-criteria`, `post-call-data-extraction`) show 0 failed jobs
+
+**Validates:** §6.2L post-call pipeline, BullMQ job execution, LLM evaluation calls, conversation record updates
+
+---
+
+### 16.9 — PII Redaction Pre-Storage E2E (CO-BROWSING §4 + BRD-CB-004)
+
+Tests that PII is stripped from transcripts before writing to PostgreSQL when `pii_redaction_enabled = true`.
+
+**Steps:**
+1. Create agent with `pii_redaction_enabled = true`
+2. Complete a test call where the simulated caller speaks: "My phone number is 07912 345678 and my date of birth is 01/01/1985"
+3. Query `conversations.transcript_json` directly in PostgreSQL
+4. Assert the transcript contains `[PHONE_NUMBER]` — NOT `07912 345678`
+5. Assert the transcript contains `[DOB]` — NOT `01/01/1985`
+6. Create second agent with `pii_redaction_enabled = false`, repeat — assert raw values ARE stored
+
+**Validates:** §6.2H PII Redaction Service, transcript storage pipeline, regex pattern correctness
+
+---
+
+### 16.10 — Environment Variables + Workspace Secrets in Tool Execution E2E (CO-BROWSING §20 + §17)
+
+Tests that `{{env.VAR}}` and `{{secret.KEY}}` are correctly resolved before a tool webhook fires.
+
+**Steps:**
+1. `POST /env-vars` → create variable `TEST_WEBHOOK_URL` with value `https://webhook.site/{unique-id}` for production
+2. `POST /workspace/secrets` → create secret `TEST_API_TOKEN` with value `Bearer test-abc-123`
+3. Create a webhook tool with `url = "{{env.TEST_WEBHOOK_URL}}"` and header `Authorization: {{secret.TEST_API_TOKEN}}`
+4. Attach tool to agent, complete a test call that invokes the tool
+5. Check webhook.site — assert the request arrived at the correct URL
+6. Assert the `Authorization` header value in the received request is `Bearer test-abc-123` (not the literal string `{{secret.TEST_API_TOKEN}}`)
+7. Assert neither raw value appears in `tools.url` or `tools.headers` columns in DB (confirm no plaintext leakage)
+
+**Validates:** §6.2V EnvVarsModule resolution, §6.2S WorkspaceSecrets resolution, tool execution pipeline, Vault integration
+
+---
+
+### 16.11 — API Key Middleware: Scope Enforcement + Credit Limit E2E (CO-BROWSING §18)
+
+Tests the API key validation middleware end-to-end, not just the key creation endpoint.
+
+**Steps:**
+1. `POST /api-keys` → create key with `restrict_key: true`, permissions: `{conversations: 'read', agents: null}`
+2. **Positive test:** `GET /conversations` with `x-api-key: {key}` header → assert HTTP 200
+3. **Negative test (wrong scope):** `POST /agents` with same key → assert HTTP 403 `"Key does not have permission for this endpoint"`
+4. **Negative test (revoked):** `DELETE /api-keys/:id` → `GET /conversations` with same key → assert HTTP 401
+5. **Credit limit test:** Create a second key with `monthly_credit_limit: 1` → invoke an endpoint that consumes credits → invoke again → assert HTTP 429 on second invocation
+6. Assert `api_keys.last_used_at` is updated after each valid use
+
+**Validates:** §6.2T ApiKeysModule, Kong gateway header forwarding, AuthModule middleware, credit tracking
+
+---
+
+### 16.12 — Batch Calling E2E: CSV → Calls → Conversations (CO-BROWSING §11)
+
+Tests the full batch calling pipeline from CSV submission to completed conversation records.
+
+**Steps:**
+1. Import a SIP test number via `POST /phone-numbers`
+2. Create and publish a test agent
+3. `POST /batch-calls` with a CSV of 3 test numbers, `send_immediately: true`, compliance_acknowledged: true
+4. Assert `batch_calls.status = 'running'` within 5 seconds
+5. Assert `batch_call_recipients` rows exist with status transitions: `pending → in_progress → completed`
+6. For each completed recipient: assert `conversation_id` is set and a `conversations` record exists
+7. Assert `batch_calls.calls_completed = 3` and `status = 'completed'`
+8. Assert dynamic variables from CSV columns are present in `conversations.client_data`
+
+**Validates:** §6.2N BatchCallModule, BatchCallWorker (BullMQ), FreeSWITCH ESL originate, conversation pipeline, dynamic variable injection
+
+---
+
+### 16.13 — Branch Traffic Routing Invariant E2E (CO-BROWSING §13)
+
+Tests that the traffic split algorithm correctly routes calls to branches and enforces the 100% invariant.
+
+**Steps:**
+1. Create an agent with Main branch at 100% live
+2. `POST /agents/:id/branches` → create Variant A branch (inherits from Main)
+3. `PUT /agents/:id/branches/{variant_a}/traffic` → `{ traffic_split: 30, status: 'live' }` — assert HTTP 200
+4. `PUT /agents/:id/branches/{main}/traffic` → `{ traffic_split: 70 }` — assert HTTP 200
+5. **Invariant test:** `PUT /agents/:id/branches/{variant_a}/traffic` → `{ traffic_split: 80 }` — assert HTTP 422 `"Traffic split would exceed 100%"`
+6. Simulate 100 calls to the agent — count which branch handled each (via `conversations.branch_id`)
+7. Assert Main handled 65–75 calls and Variant A handled 25–35 (within ±5% tolerance of 70/30 split)
+
+**Validates:** §6.2P BranchesModule, traffic routing algorithm, conversation branch_id tagging, 100% invariant enforcement
+
+---
+
+### 16.14 — Platform Webhook Delivery + HMAC Verification E2E (CO-BROWSING §19)
+
+Tests the full platform webhook event delivery flow with signature verification.
+
+**Steps:**
+1. Stand up a test HTTP server (Node.js `http.createServer`) on localhost listening for POST requests
+2. `POST /api/webhooks` → create endpoint pointing to test server, subscribe to `agent.published`
+3. Publish an agent → assert the test server receives a POST within 5 seconds
+4. Verify `X-TRUSTNOW-Signature` header: compute `HMAC-SHA256(payload_body, shared_secret)` and compare — assert match
+5. Assert `webhook_delivery_log` row created with `http_status = 200` and `success = true`
+6. **Retry test:** Configure test server to return 503 on first call → assert TRUSTNOW retries → assert `webhook_delivery_log` shows `attempt_number = 2` on success
+7. Delete the webhook → publish another agent → assert no POST received
+
+**Validates:** §6.2U WebhookEndpointsModule, event emission on publish, HMAC signing, BullMQ retry logic, delivery log
+
+---
+
+### 16.15 — Widget Embed → Conversation → CSAT E2E (CO-BROWSING §3)
+
+Tests the full widget deployment lifecycle: embed script loads → conversation starts → CSAT submitted.
+
+**Steps:**
+1. Create and publish an agent with `feedback_enabled = true`
+2. Load a test HTML page containing:
+   ```html
+   <trustnow-agent agent-id="{agent_id}"></trustnow-agent>
+   <script src="https://cdn.trustnow.ai/widget/embed.js" async></script>
+   ```
+3. Assert the `<trustnow-agent>` custom element renders (not just script loaded)
+4. Assert no CSP violations in browser console (no `eval()`, no inline scripts)
+5. Programmatically initiate a conversation via the widget's public API
+6. Assert a `conversations` record is created in DB with `channel = 'widget'`
+7. Submit CSAT: `POST /widget/feedback` with `{conversation_id, rating: 4, comment: "Test feedback"}`
+8. Assert `conversations.rating = 4` and `conversations.feedback_text = "Test feedback"` in DB
+
+**Validates:** Widget CDN bundle (L5-03), §6.2G WidgetModule, conversation channel tracking, CSAT collection, CSP compliance
+
+---
+
+### 16.16 — Conversations Retention Purge Cron E2E (CO-BROWSING §4)
+
+Tests that the retention purge job deletes expired conversations and their MinIO recordings.
+
+**Steps:**
+1. Create an agent with `conversations_retention_days = 1`
+2. Insert a test conversation record directly in DB with `started_at = NOW() - INTERVAL '2 days'` and a dummy `recording_url` pointing to a MinIO test object
+3. Create the MinIO test object at that path
+4. Trigger the retention purge job manually (or wait for the 03:00 UTC cron — use manual trigger in test mode)
+5. Assert the conversation record no longer exists in `conversations`
+6. Assert the MinIO object at `recording_url` no longer exists
+7. Assert `audit_logs` contains a `retention_purge` entry for this agent_id
+
+**Validates:** §6.2H retention purge cron, MinIO cleanup, cascade deletes, audit logging
+
+---
+
+## Test Coverage Gap Summary
+
+The 10 new tests above (§16.7–§16.16) cover the following new modules from the co-browsing translation:
+
+| New Test | Modules Covered |
+|----------|----------------|
+| 16.7 Wizard → Live Call | §6.2D-B, agent_templates, publish flow |
+| 16.8 Post-Call Jobs Pipeline | §6.2L (all 3 BullMQ jobs) |
+| 16.9 PII Redaction | §6.2H PII service, transcript storage |
+| 16.10 Env Vars + Secrets in Tools | §6.2V, §6.2S, tool execution |
+| 16.11 API Key Scope + Credits | §6.2T, AuthModule middleware |
+| 16.12 Batch Calling E2E | §6.2N, BatchCallWorker, FreeSWITCH |
+| 16.13 Branch Traffic Routing | §6.2P, routing algorithm |
+| 16.14 Platform Webhook Delivery | §6.2U, HMAC, retry logic |
+| 16.15 Widget → Conversation → CSAT | §6.2G, CDN bundle, CSP |
+| 16.16 Retention Purge Cron | §6.2H cron, MinIO cleanup |
+
+**Modules NOT given a dedicated E2E test** (adequately covered by task-level isolation tests):
+- §6.2E Agent Templates seed data — verified by 16.7 indirectly
+- §6.2F Translate-first-message — unit test in Task 6
+- §6.2K KB/RAG endpoints — covered by existing §16.5
+- §6.2M Phone Numbers CRUD — covered by 16.12 as prerequisite
+- §6.2O Workflow canvas save/load — frontend + single module, unit test in Task 8
+- §6.2Q Tests module execution — self-contained, unit test in Task 6
+- §6.2R WhatsApp — requires Meta account; manual test only (see note below)
+- §6.2W Standalone TTS — single-service test, Task 8 isolation
+- §6.2X Async STT — single-service test, Task 8 isolation
+
+**WhatsApp note:** §6.2R (WhatsApp) cannot be automated in Task 16 without a live Meta Business Account and test WhatsApp number. Document as a **manual go-live gate test** instead: "Before first BPO client deployment, verify WhatsApp inbound message → agent response flow using the TRUSTNOW test WhatsApp account."
 
 ---
 

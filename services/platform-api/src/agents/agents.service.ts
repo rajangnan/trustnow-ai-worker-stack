@@ -7,6 +7,8 @@ import { CreateAgentDto } from './dto/create-agent.dto';
 import { UpdateAgentConfigDto } from './dto/update-agent-config.dto';
 import { CreateBranchDto, UpdateBranchTrafficDto } from './dto/create-branch.dto';
 import { CreateAgentWizardDto } from './dto/create-agent-wizard.dto';
+import { CreateAgentBlankDto } from './dto/create-agent-blank.dto';
+import { INDUSTRY_SLUGS, INDUSTRY_USE_CASES } from './constants/industry-use-cases';
 import axios from 'axios';
 
 @Injectable()
@@ -468,9 +470,68 @@ export class AgentsService {
     return { success: true };
   }
 
-  // ── Wizard (§6.2D) ──────────────────────────────────────────────────────
+  // ── Blank Agent (§6.2D-A) ────────────────────────────────────────────────
+
+  async createBlank(tenantId: string, dto: CreateAgentBlankDto, actorId: string) {
+    const pool = getPool();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SET LOCAL app.current_tenant = '${tenantId}'`);
+      const { rows: agentRows } = await client.query(
+        `INSERT INTO agents (tenant_id, name, type, partition, environment, created_by)
+         VALUES ($1, $2, 'conversational', 'cloud', 'production', $3) RETURNING *`,
+        [tenantId, dto.agent_name, actorId],
+      );
+      const agent = agentRows[0];
+      await client.query(`INSERT INTO agent_configs (agent_id, version, system_prompt, first_message) VALUES ($1, 1, '', '')`, [agent.agent_id]);
+      await client.query(
+        `INSERT INTO agent_versions (agent_id, version, published_by, is_live, traffic_split_pct) VALUES ($1, 1, $2, false, 100)`,
+        [agent.agent_id, actorId],
+      );
+      await client.query('COMMIT');
+      await this.audit.log({ tenant_id: tenantId, actor_id: actorId, action: 'agent.blank.create', resource_type: 'agent', resource_id: agent.agent_id, diff_json: dto as any });
+      return { agent_id: agent.agent_id, config: { system_prompt: '', first_message: '', text_only: dto.text_only ?? false, status: 'draft' }, redirect_url: `/app/agents/${agent.agent_id}?tab=agent` };
+    } catch (err) { await client.query('ROLLBACK'); throw err; } finally { client.release(); }
+  }
+
+  // ── Translate First Message (§6.2F) ──────────────────────────────────────
+
+  async translateFirstMessage(tenantId: string, agentId: string, actorId: string) {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT ac.first_message, ac.additional_languages, ac.primary_language, ac.first_message_localized
+       FROM agent_configs ac JOIN agents a ON a.agent_id = ac.agent_id
+       WHERE a.tenant_id = $1 AND ac.agent_id = $2`,
+      [tenantId, agentId],
+    );
+    if (!rows.length) throw new NotFoundException('Agent not found');
+    const { first_message, additional_languages, primary_language, first_message_localized } = rows[0];
+    const langs: string[] = additional_languages || [];
+    if (!langs.length) throw new BadRequestException('No additional languages configured. Add languages in the Language section first.');
+    const localized: Record<string, string> = { ...(first_message_localized || {}) };
+    const libreUrl = process.env.LIBRETRANSLATE_URL || 'http://127.0.0.1:5000';
+    for (const lang of langs) {
+      try {
+        const res = await axios.post(`${libreUrl}/translate`, { q: first_message, source: primary_language || 'en', target: lang, format: 'text' }, { timeout: 10000 });
+        localized[lang] = res.data?.translatedText || first_message;
+      } catch { localized[lang] = first_message; }
+    }
+    await pool.query(`UPDATE agent_configs SET first_message_localized = $1 WHERE agent_id = $2`, [JSON.stringify(localized), agentId]);
+    return { first_message_localized: localized, translated_languages: langs, source_language: primary_language || 'en' };
+  }
+
+  // ── Wizard (§6.2D-B) ────────────────────────────────────────────────────
 
   async createViaWizard(tenantId: string, dto: CreateAgentWizardDto, actorId: string) {
+    // Validate industry + use_case (§6.2D-C)
+    if (!INDUSTRY_SLUGS.includes(dto.industry as any)) {
+      throw new BadRequestException(`Industry '${dto.industry}' is not valid`);
+    }
+    const validUseCases = INDUSTRY_USE_CASES[dto.industry as keyof typeof INDUSTRY_USE_CASES] || [];
+    if (!validUseCases.includes(dto.use_case)) {
+      throw new BadRequestException(`Use case '${dto.use_case}' is not valid for industry '${dto.industry}'`);
+    }
     const pool = getPool();
 
     // 1. Look up matching template

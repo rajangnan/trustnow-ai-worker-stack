@@ -1,4 +1,5 @@
-import { Controller, Get, Put, Param, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Put, Post, Param, Body, UseGuards, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { WidgetService } from './widget.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -25,6 +26,26 @@ export class WidgetController {
   @ApiOperation({ summary: 'Update widget config (Tab 8 — all fields incl. expanded_behavior, avatar_type, include_www_variants, allow_http_links)' })
   updateWidget(@TenantId() tid: string, @Param('id') id: string, @Body() dto: any, @CurrentUser() u: any) {
     return this.service.updateWidget(tid, id, dto, u.user_id);
+  }
+
+  @Post(':id/widget/avatar')
+  @Roles('agent_admin', 'tenant_admin', 'platform_admin')
+  @ApiOperation({ summary: 'Upload avatar image for widget (§6.2G) — JPEG/PNG/WebP/GIF, max 2MB' })
+  @UseInterceptors(FileInterceptor('file'))
+  uploadAvatar(
+    @TenantId() tid: string,
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File,
+    @CurrentUser() u: any,
+  ) {
+    return this.service.uploadAvatar(tid, id, file, u.user_id);
+  }
+
+  @Get(':id/widget/shareable-url')
+  @Roles('agent_admin', 'operator', 'tenant_admin', 'platform_admin')
+  @ApiOperation({ summary: 'Get public shareable URL for agent widget (§6.2G)' })
+  getShareableUrl(@TenantId() tid: string, @Param('id') id: string) {
+    return this.service.getShareableUrl(tid, id);
   }
 
   @Get(':id/widget/embed')

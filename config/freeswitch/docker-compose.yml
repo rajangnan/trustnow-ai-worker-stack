@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  trustnow-freeswitch:
+    image: safarov/freeswitch:latest
+    container_name: trustnow-freeswitch
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch:/etc/freeswitch
+      - /opt/trustnowailabs/trustnow-ai-worker-stack/data/recordings:/var/lib/freeswitch/recordings
+      - /opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch/sounds:/usr/share/freeswitch/sounds/music/default
+    environment:
+      - FREESWITCH_ESL_PASSWORD=e72defd69834a0611be4aa2d8e0952d8a0c026593ae221b90c435bf39e61a3c3
+    cap_add:
+      - SYS_NICE
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536

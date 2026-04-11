@@ -1,0 +1,12 @@
+<include>
+  <X-PRE-PROCESS cmd="set" data="default_password=e72defd69834a0611be4aa2d8e0952d8a0c026593ae221b90c435bf39e61a3c3"/>
+  <X-PRE-PROCESS cmd="set" data="domain=172.25.10.142"/>
+  <X-PRE-PROCESS cmd="set" data="domain_name=$${domain}"/>
+  <X-PRE-PROCESS cmd="set" data="local_ip_v4=172.25.10.142"/>
+  <X-PRE-PROCESS cmd="set" data="external_rtp_ip=172.25.10.142"/>
+  <X-PRE-PROCESS cmd="set" data="external_sip_ip=172.25.10.142"/>
+  <X-PRE-PROCESS cmd="set" data="rtp_start_port=16384"/>
+  <X-PRE-PROCESS cmd="set" data="rtp_end_port=32768"/>
+  <X-PRE-PROCESS cmd="set" data="recordings_dir=/var/lib/freeswitch/recordings"/>
+  <X-PRE-PROCESS cmd="set" data="trustnow_esl_password=e72defd69834a0611be4aa2d8e0952d8a0c026593ae221b90c435bf39e61a3c3"/>
+</include>

@@ -746,6 +746,52 @@ TRUSTNOW is a fully enterprise-grade, multi-tenant Autonomous AI Worker Stack ta
 - FreeSWITCH ESL: 127.0.0.1:8021 (localhost only)
 - LiveKit: 0.0.0.0:7880 (HTTP/WS) + UDP 50000-60000 (RTP)
 
+### [2026-04-11] ADDENDUM 6A — NestJS Platform API: 21 New Modules (§6.2D–§6.2X)
+**Status:** ✅ COMPLETE
+
+All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are implemented and registered.
+
+**Previously completed (prior sessions):**
+- §6.2D — AgentWizard ✅
+- §6.2E — 48 Tier 1 Templates (seed-agent-templates-tier1.sql) ✅
+- §6.2F — SecurityModule (PII, fraud, OFAC, GDPR) ✅
+- §6.2G — Widget avatar upload + shareable URL ✅
+- §6.2H — RetentionPurgeJob (daily 03:00 cron, MinIO cleanup) ✅
+- §6.2I — WebhooksModule extended ✅
+- §6.2J — ToolsModule (PATCH system tools, MCP CRUD, test, history) ✅
+- §6.2K — KnowledgeBase workspace architecture (migrate-003, junction table) ✅
+- §6.2L — AnalysisModule (criteria, data-specs, 3 BullMQ post-call jobs) + ConversationsModule extended (15 filters, turns, share-link) ✅
+- §6.2M — PhoneNumbersModule ✅
+- §6.2N — BatchCallsModule ✅
+- §6.2O — WorkflowModule ✅
+- §6.2P — BranchesModule ✅
+
+**Completed this session:**
+- §6.2Q — TestsModule rewritten: workspace CRUD, 3 test types (next_reply/tool_invocation/simulation), templates GET+clone, async BullMQ execution (test-execution queue), GET /test-runs/:run_id, agent attach/detach, test folders CRUD ✅
+- §6.2R — WhatsAppModule: accounts CRUD, Meta OAuth connect, outbound message+call, inbound webhook (@SkipAuth, X-Hub-Signature-256 verified), GET webhook challenge ✅
+- §6.2S — SettingsModule: workspace settings UPSERT, webhook test, secrets (Vault path), auth connections CRUD with 409 guard ✅
+- §6.2T — ApiKeysModule: sk-tn_ prefix, SHA-256 hash, one-time reveal, list/update/revoke; ApiKeyMiddleware (x-api-key header, fire-and-forget last_used_at) ✅
+- §6.2U — WebhookEndpointsModule: HMAC shared secret, 7 event types, deliverWebhookEvent() with 3-attempt exponential backoff (5s/25s), rotate-secret ✅
+- §6.2V — EnvVarsModule: CRUD, UPSERT on conflict(var_id, environment), resolveEnvVars() with {{env.VAR_NAME}} tokens + production fallback ✅
+- §6.2W — StandaloneTTSModule: ElevenLabs TTS API, MinIO trustnow-tts-generations, presigned URLs (1h TTL), history + download + delete ✅
+- §6.2X — AsyncSTTModule: BullMQ stt-transcribe processor, ElevenLabs Scribe v2, MinIO trustnow-stt-transcripts, list/get/export(txt/json/srt)/rename/delete ✅
+
+**app.module.ts:** All 21+ modules registered; BullModule.forRootAsync (REDIS_PASSWORD from env); ApiKeyMiddleware applied globally ✅
+
+**Build:** npm run build → 0 errors (fixed @types/multer missing) ✅
+
+**Smoke test:** `curl http://127.0.0.1:3001/tests` → 401 (route registered, JWT required) ✅
+**Smoke test:** `curl http://127.0.0.1:3001/env-vars` → 401 ✅
+**Smoke test:** `curl http://127.0.0.1:3001/api-keys` → 401 ✅
+
+**New MinIO buckets required (provision before Task 8):**
+- trustnow-tts-generations (standalone TTS audio)
+- trustnow-stt-transcripts (async STT upload files)
+- trustnow-widget-assets (already created in §6.2G)
+- trustnow-kb-docs (already created in §6.2K)
+
+**Addendum 7A (FreeSWITCH outbound SIP):** Not yet implemented. Required before BatchCallModule makeOutboundCall() goes live. Create config/freeswitch/sip_profiles/external.xml with trustnow_trunk gateway pointing to SIP carrier.
+
 ### TASK 8 onwards ← NEXT STEP
 - Agent Configuration Module (Next.js + shadcn/ui — UI-SPEC-001.md §6.4, 10 tabs)
 - Human Agent Desktop

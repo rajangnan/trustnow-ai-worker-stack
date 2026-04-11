@@ -1,15 +1,30 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { getPool } from '../database/db.provider';
+import * as jwt from 'jsonwebtoken';
 
 @Injectable()
 export class ConversationsService {
-  // Full conversation shape including all co-browsing metadata fields (§6.2C)
+  // Full conversation list with 15 query filters (§6.2L)
   async findAll(tenantId: string, filters?: {
     agent_id?: string;
-    status?: string;
+    branch_id?: string;
+    date_after?: string;
+    date_before?: string;
+    call_status?: string;
+    duration_min?: number;
+    duration_max?: number;
+    rating_min?: number;
+    rating_max?: number;
+    has_comments?: boolean;
+    language?: string;
+    user_id?: string;
     channel?: string;
+    search?: string;
+    sort?: string;
+    page?: number;
     limit?: number;
-    offset?: number;
+    // legacy
+    status?: string;
     from?: string;
     to?: string;
   }) {
@@ -19,20 +34,43 @@ export class ConversationsService {
     let query = `
       SELECT c.*,
              a.name AS agent_name,
-             a.type AS agent_type
+             a.type AS agent_type,
+             av.version AS branch_name
       FROM conversations c
       JOIN agents a ON a.agent_id = c.agent_id
+      LEFT JOIN agent_versions av ON av.version_id = c.branch_id
       WHERE c.tenant_id = $1`;
-    if (filters?.agent_id) { query += ` AND c.agent_id = $${i++}`; params.push(filters.agent_id); }
-    if (filters?.status) { query += ` AND c.status = $${i++}`; params.push(filters.status); }
-    if (filters?.channel) { query += ` AND c.channel = $${i++}`; params.push(filters.channel); }
-    if (filters?.from) { query += ` AND c.started_at >= $${i++}`; params.push(filters.from); }
-    if (filters?.to) { query += ` AND c.started_at <= $${i++}`; params.push(filters.to); }
-    query += ` ORDER BY c.started_at DESC`;
-    query += ` LIMIT $${i++}`; params.push(filters?.limit || 50);
-    query += ` OFFSET $${i++}`; params.push(filters?.offset || 0);
+    if (filters?.agent_id)   { query += ` AND c.agent_id = $${i++}`;   params.push(filters.agent_id); }
+    if (filters?.branch_id)  { query += ` AND c.branch_id = $${i++}`;  params.push(filters.branch_id); }
+    if (filters?.date_after || filters?.from) { query += ` AND c.started_at >= $${i++}`; params.push(filters.date_after || filters.from); }
+    if (filters?.date_before || filters?.to)  { query += ` AND c.started_at <= $${i++}`; params.push(filters.date_before || filters.to); }
+    if (filters?.call_status || filters?.status) {
+      query += ` AND c.call_successful = $${i++}`;
+      params.push((filters.call_status === 'successful' || filters.status === 'successful'));
+    }
+    if (filters?.channel)      { query += ` AND c.channel = $${i++}`;                params.push(filters.channel); }
+    if (filters?.language)     { query += ` AND c.language_detected = $${i++}`;      params.push(filters.language); }
+    if (filters?.user_id)      { query += ` AND c.user_id = $${i++}`;                params.push(filters.user_id); }
+    if (filters?.duration_min) { query += ` AND c.duration_s >= $${i++}`;            params.push(filters.duration_min); }
+    if (filters?.duration_max) { query += ` AND c.duration_s <= $${i++}`;            params.push(filters.duration_max); }
+    if (filters?.rating_min)   { query += ` AND c.rating >= $${i++}`;                params.push(filters.rating_min); }
+    if (filters?.rating_max)   { query += ` AND c.rating <= $${i++}`;                params.push(filters.rating_max); }
+    if (filters?.has_comments === true)  { query += ` AND c.feedback_text IS NOT NULL AND c.feedback_text != ''`; }
+    if (filters?.search)       { query += ` AND c.transcript_json::text ILIKE $${i++}`; params.push(`%${filters.search}%`); }
+    const sort = filters?.sort === 'date_asc' ? 'ASC' : 'DESC';
+    query += ` ORDER BY c.started_at ${sort}`;
+    const pageLimit = Math.min(filters?.limit || 20, 100);
+    const pageOffset = ((filters?.page || 1) - 1) * pageLimit;
+    query += ` LIMIT $${i++} OFFSET $${i++}`;
+    params.push(pageLimit, pageOffset);
     const { rows } = await pool.query(query, params);
-    return rows;
+    return {
+      conversations: rows,
+      total: rows.length,
+      page: filters?.page || 1,
+      limit: pageLimit,
+      has_more: rows.length === pageLimit,
+    };
   }
 
   // Full conversation detail — all co-browsing metadata (§6.2C)
@@ -95,5 +133,40 @@ export class ConversationsService {
     );
     if (!rows.length) throw new NotFoundException('Conversation not found');
     return { conversation_id: conversationId, recording_url: rows[0].recording_url, metadata: rows[0] };
+  }
+
+  async getTurns(tenantId: string, conversationId: string) {
+    const pool = getPool();
+    const { rows: check } = await pool.query(
+      `SELECT conversation_id FROM conversations WHERE tenant_id = $1 AND conversation_id = $2`,
+      [tenantId, conversationId],
+    );
+    if (!check.length) throw new NotFoundException('Conversation not found');
+    const { rows } = await pool.query(
+      `SELECT * FROM conversation_turns WHERE conversation_id = $1 ORDER BY turn_index`,
+      [conversationId],
+    );
+    return rows;
+  }
+
+  async getShareLink(tenantId: string, conversationId: string) {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT conversation_id FROM conversations WHERE tenant_id = $1 AND conversation_id = $2`,
+      [tenantId, conversationId],
+    );
+    if (!rows.length) throw new NotFoundException('Conversation not found');
+    const secret = process.env.JWT_SECRET || 'trustnow-secret';
+    const token = jwt.sign(
+      { conversation_id: conversationId, tenant_id: tenantId, type: 'share' },
+      secret,
+      { expiresIn: '24h' },
+    );
+    const appBase = process.env.APP_BASE_URL || 'https://app.trustnow.ai';
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    return {
+      share_url: `${appBase}/conversations/${conversationId}?token=${token}`,
+      expires_at: expiresAt,
+    };
   }
 }

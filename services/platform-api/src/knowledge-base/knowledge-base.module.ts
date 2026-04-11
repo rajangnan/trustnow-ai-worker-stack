@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
 import { KnowledgeBaseService } from './knowledge-base.service';
-import { KnowledgeBaseController } from './knowledge-base.controller';
+import { KnowledgeBaseController, AgentKbController } from './knowledge-base.controller';
 
 @Module({
   providers: [KnowledgeBaseService],
-  controllers: [KnowledgeBaseController],
+  controllers: [KnowledgeBaseController, AgentKbController],
   exports: [KnowledgeBaseService],
 })
 export class KnowledgeBaseModule {}

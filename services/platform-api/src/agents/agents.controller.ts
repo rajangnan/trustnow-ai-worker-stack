@@ -7,6 +7,7 @@ import { CreateAgentDto } from './dto/create-agent.dto';
 import { UpdateAgentConfigDto } from './dto/update-agent-config.dto';
 import { CreateBranchDto, UpdateBranchTrafficDto } from './dto/create-branch.dto';
 import { CreateAgentWizardDto } from './dto/create-agent-wizard.dto';
+import { CreateAgentBlankDto } from './dto/create-agent-blank.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -150,12 +151,30 @@ export class AgentsController {
     return this.service.deleteBranch(tid, id, branchId, u.user_id);
   }
 
-  // ── Wizard (§6.2D) ────────────────────────────────────────────────────────
+  // ── Blank Agent (§6.2D-A) ─────────────────────────────────────────────────
+
+  @Post('blank')
+  @Roles('agent_admin', 'tenant_admin', 'platform_admin')
+  @ApiOperation({ summary: 'Create blank agent (§6.2D-A) — minimal 2-step creation, no LLM' })
+  createBlank(@TenantId() tid: string, @Body() dto: CreateAgentBlankDto, @CurrentUser() u: any) {
+    return this.service.createBlank(tid, dto, u.user_id);
+  }
+
+  // ── Wizard (§6.2D-B) ──────────────────────────────────────────────────────
 
   @Post('wizard')
   @Roles('agent_admin', 'tenant_admin', 'platform_admin')
-  @ApiOperation({ summary: '+New Agent wizard (§6.2D) — creates agent with LLM-generated prompts' })
+  @ApiOperation({ summary: '+New Agent guided wizard (§6.2D-B) — LLM-generated prompts' })
   createWizard(@TenantId() tid: string, @Body() dto: CreateAgentWizardDto, @CurrentUser() u: any) {
     return this.service.createViaWizard(tid, dto, u.user_id);
+  }
+
+  // ── Translate First Message (§6.2F) ───────────────────────────────────────
+
+  @Post(':id/translate-first-message')
+  @Roles('agent_admin', 'tenant_admin', 'platform_admin')
+  @ApiOperation({ summary: 'Translate first message to all additional languages (§6.2F)' })
+  translateFirstMessage(@TenantId() tid: string, @Param('id') id: string, @CurrentUser() u: any) {
+    return this.service.translateFirstMessage(tid, id, u.user_id);
   }
 }

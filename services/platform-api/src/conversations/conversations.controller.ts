@@ -15,23 +15,57 @@ export class ConversationsController {
 
   @Get()
   @Roles('supervisor', 'agent_admin', 'tenant_admin', 'platform_admin', 'auditor')
-  @ApiOperation({ summary: 'List conversations (BRD-L5-MIS-002)' })
+  @ApiOperation({ summary: 'List conversations — 15 query filters (§6.2L): agent_id, branch_id, date_after, date_before, call_status, channel, language, search, duration_min/max, rating_min/max, has_comments, sort, page, limit' })
   findAll(
     @TenantId() tid: string,
-    @Query('agent_id') agentId?: string,
-    @Query('status') status?: string,
+    @Query('agent_id') agent_id?: string,
+    @Query('branch_id') branch_id?: string,
+    @Query('date_after') date_after?: string,
+    @Query('date_before') date_before?: string,
+    @Query('call_status') call_status?: string,
     @Query('channel') channel?: string,
-    @Query('limit') limit?: number,
-    @Query('offset') offset?: number,
-    @Query('from') from?: string,
-    @Query('to') to?: string,
+    @Query('language') language?: string,
+    @Query('user_id') user_id?: string,
+    @Query('search') search?: string,
+    @Query('duration_min') duration_min?: string,
+    @Query('duration_max') duration_max?: string,
+    @Query('rating_min') rating_min?: string,
+    @Query('rating_max') rating_max?: string,
+    @Query('has_comments') has_comments?: string,
+    @Query('sort') sort?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
   ) {
-    return this.service.findAll(tid, { agent_id: agentId, status, channel, limit, offset, from, to });
+    return this.service.findAll(tid, {
+      agent_id, branch_id, date_after, date_before, call_status,
+      channel, language, user_id, search, sort,
+      duration_min: duration_min ? parseInt(duration_min) : undefined,
+      duration_max: duration_max ? parseInt(duration_max) : undefined,
+      rating_min: rating_min ? parseFloat(rating_min) : undefined,
+      rating_max: rating_max ? parseFloat(rating_max) : undefined,
+      has_comments: has_comments === 'true' ? true : undefined,
+      page: page ? parseInt(page) : 1,
+      limit: limit ? parseInt(limit) : 20,
+    });
+  }
+
+  @Get(':id/turns')
+  @Roles('supervisor', 'agent_admin', 'tenant_admin', 'platform_admin', 'auditor')
+  @ApiOperation({ summary: 'Get per-turn latency data (§6.2L)' })
+  getTurns(@TenantId() tid: string, @Param('id') id: string) {
+    return this.service.getTurns(tid, id);
+  }
+
+  @Get(':id/share-link')
+  @Roles('supervisor', 'agent_admin', 'tenant_admin', 'platform_admin')
+  @ApiOperation({ summary: 'Generate shareable link (24h JWT token — §6.2L)' })
+  getShareLink(@TenantId() tid: string, @Param('id') id: string) {
+    return this.service.getShareLink(tid, id);
   }
 
   @Get(':id')
   @Roles('supervisor', 'agent_admin', 'tenant_admin', 'platform_admin', 'auditor')
-  @ApiOperation({ summary: 'Get conversation detail — all co-browsing metadata (§6.2C): call_successful, how_call_ended, user_id, branch_id, tts_latency_ms_avg, asr_latency_ms_avg, turn_count, call_cost_credits, llm_credits, environment, evaluation_results, data_collection_results' })
+  @ApiOperation({ summary: 'Get conversation detail — all metadata fields (§6.2C/§6.2L)' })
   findOne(@TenantId() tid: string, @Param('id') id: string) {
     return this.service.findOne(tid, id);
   }
