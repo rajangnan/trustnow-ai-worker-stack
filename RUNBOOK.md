@@ -895,9 +895,29 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 - Voice pipeline end-to-end (Task 10)
 - Web Widget publisher (Task 11)
 
-**Pre-Task 8 prerequisites:**
-- Provision MinIO buckets: `trustnow-tts-generations` and `trustnow-stt-transcripts` (before TTS/STT modules go live)
-- Read UI-SPEC-001.md §6.1, §6.3, §6.4 (all 10 tabs), §6.5–§6.8 IN FULL before writing any component
+**Pre-Task 8 prerequisites:** ALL CLEARED ✅
+
+### [2026-04-11] Task Addendum Blockers — RESOLVED
+| # | Blocker | Status | Notes |
+|---|---------|--------|-------|
+| B-1 | Keycloak DB auth failure | ✅ FIXED 2026-04-11 | `keycloak` pg role created (was missing), password set from Vault `secret/trustnow/postgres/keycloak`; port 8080 freed by stopping Tomcat10 (re-enabled after server reboot — stopped + disabled again) |
+| B-2 | Kong DB auth failure | ✅ FIXED 2026-04-11 | `kong` pg role + `kong` db created (was missing), password set from Vault `secret/trustnow/postgres/kong`; `kong migrations bootstrap` run (67 migrations executed); port 8000 freed by stopping `netxmsd` (PID 1893569 held :8000); Kong service + catch-all route re-registered via Admin API |
+| B-3 | `trustnow-tts-generations` bucket | ✅ PROVISIONED 2026-04-11 | Created via `mc mb local/trustnow-tts-generations` |
+| B-4 | `trustnow-stt-transcripts` bucket | ✅ PROVISIONED 2026-04-11 | Created via `mc mb local/trustnow-stt-transcripts` |
+
+**Verification:**
+- `curl http://127.0.0.1:8000/agents` → **401** (Kong up, routing to NestJS, auth enforced) ✅
+- `curl http://127.0.0.1:8000/health` → **200** ✅
+- Keycloak: `trustnow-keycloak Up` ✅
+- Kong: `trustnow-kong Up (healthy)` ✅
+- MinIO buckets: `trustnow-tts-generations`, `trustnow-stt-transcripts` listed ✅
+
+**Root causes logged:**
+- `keycloak` and `kong` pg roles never existed — the DB was re-initialised during the PG outage fix but roles were not recreated
+- `netxmsd` (NetXMS monitoring daemon) grabbed port 8000 after server reboot — `sudo systemctl stop netxmsd` freed it
+- Tomcat10 re-enabled itself after the kernel upgrade reboot (2026-03-24 task) — stopped and disabled again
+- Kong DB bootstrap required because the `kong` database was brand new (created this session)
+- Kong routes lost on DB bootstrap — re-registered: service `trustnow-platform-api` → `http://127.0.0.1:3001`, route `/` catch-all
 
 ### Current service state (as of 2026-04-11)
 | Service | Status | Notes |
@@ -905,7 +925,7 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 | trustnow-platform-api (systemd) | ✅ active | NestJS on :3001, PgBouncer :5433 |
 | postgresql@16-main (systemd) | ✅ active | Restored 2026-04-11 (SSL key perms fix) |
 | trustnow-redis (docker) | ✅ Up | :6379 |
-| trustnow-minio (docker) | ✅ Up | :9000/:9001 |
+| trustnow-minio (docker) | ✅ Up | :9000/:9001 — 6 buckets incl. tts-generations + stt-transcripts |
 | trustnow-kafka (docker) | ✅ Up | KRaft mode |
 | trustnow-qdrant (docker) | ✅ Up | :6333 |
 | trustnow-litellm (docker) | ✅ Up | :4000 |
@@ -914,14 +934,22 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 | trustnow-prometheus (docker) | ✅ Up | :9090 |
 | trustnow-grafana (docker) | ✅ Up | :3000 |
 | trustnow-loki (docker) | ✅ Up | :3100 |
-| trustnow-kong (docker) | ⚠️ Restarting | Auth failure vs PostgreSQL — kong DB user pwd issue; pre-existing since PG outage 2026-04-09 |
-| trustnow-keycloak (docker) | ⚠️ Restarting | Auth failure vs PostgreSQL — keycloak DB user pwd issue; pre-existing since PG outage 2026-04-09 |
-
-**Kong/Keycloak restart root cause:** PostgreSQL was down from 2026-04-09 to 2026-04-11 (SSL key perms). On restore, both services fail auth — likely `kong` and `keycloak` pg users need passwords reset or pg_hba reconfigured. Requires Architect sign-off before touching auth infrastructure.
+| trustnow-kong (docker) | ✅ Up (healthy) | :8000/:8001/:8443 — routes registered; DB bootstrapped fresh |
+| trustnow-keycloak (docker) | ✅ Up | :8080 — dev mode, pg auth fixed |
 
 ### Carry-forward open items
-- **⚠️ Kong + Keycloak DB auth failing** — pg users `kong` and `keycloak` need password reset after PG outage; both containers restarting continuously
-- **⚠️ Provision MinIO buckets** — `trustnow-tts-generations` and `trustnow-stt-transcripts` not yet created
+- **netxmsd** re-holds :8000 after server reboot — may need a permanent fix (firewall rule or netxms config change) to stop it binding :8000; coordinate with server team
+- **Tomcat10** re-enables itself after reboots — monitor and disable after any reboot
+- **Kong routes** — re-registered this session after DB bootstrap; if Kong DB is lost again routes must be re-registered via Admin API (:8001)
+- Vault auto-unseal: currently manual — consider cloud KMS auto-unseal for production
+- LiteLLM API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY etc.) must be injected as env vars when real keys are available
+- Keycloak start-dev mode → production mode before go-live
+- MinIO SSE-S3 encryption: requires Vault KMS integration (post-Task 3)
+- GitHub: main branch pushed, tracking origin/main ✅ (latest: 22d6cfc)
+- Self-signed TLS cert: replace with Let's Encrypt or corporate CA before production
+- Kafka: migrated to KRaft mode (Zookeeper removed) — see Task 4B-KRaft entry below ✅
+- Vault: migrated to Raft storage (HA enabled) — see Task 4B-Raft entry below ✅ ⚠️ NEW vault-init.json — ARCHITECT MUST BACK UP IMMEDIATELY
+- **PostgreSQL port note:** From Task 5 onwards, all app services use PgBouncer on :5433. Direct :5432 access is for DBA/admin only.
 - Vault auto-unseal: currently manual — consider cloud KMS auto-unseal for production
 - LiteLLM API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY etc.) must be injected as env vars when real keys are available
 - Keycloak start-dev mode → production mode before go-live
