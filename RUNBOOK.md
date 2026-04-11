@@ -880,22 +880,38 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 
 ---
 
-### TASK 8 ← NEXT (awaiting Architect instruction)
-- **§8.1** Frontend scaffold: Next.js + TypeScript + Tailwind + shadcn/ui + dnd-kit + Zustand + React Query
-- **§8.2** Global layout: sidebar (Configure/Monitor/Deploy groups), top bar, breadcrumb — per UI-SPEC §6.1
-- **§8.3** Home/Dashboard page — per UI-SPEC §6.2
-- **§8.4** Agent List page — per UI-SPEC §6.3
-- **§8.5** Agent Config Module: all 10 tabs — per UI-SPEC §6.4
-- **§8.6** Voice Picker side sheet — per UI-SPEC §6.5
-- **§8.7** Voice Library page — per UI-SPEC §6.6
-- **§8.8** Knowledge Base global page — per UI-SPEC §6.7
-- **§8.9** Tools global page — per UI-SPEC §6.8
-- **§8.10** Verification
-- Human Agent Desktop (Task 9)
-- Voice pipeline end-to-end (Task 10)
-- Web Widget publisher (Task 11)
+### [2026-04-11] TASK 8 — Frontend (Next.js Agent Config Module)
+**Status:** ✅ COMPLETE
+**Commit:** (see git log)
+**Stack:** Next.js 16.2.3 · React 19 · Tailwind v4 · Radix UI · Zustand · React Query · dnd-kit · Recharts · Lucide
+**Location:** `services/frontend/`
+
+| Step | Description | Status |
+|------|-------------|--------|
+| §8.1 | Frontend scaffold: Next.js + TypeScript + Tailwind + shadcn/ui + dnd-kit + Zustand + React Query | ✅ |
+| §8.2 | Global layout: 240px sidebar (Configure/Monitor/Deploy), 56px top bar, live calls counter | ✅ |
+| §8.3 | Dashboard page: 6 KPI cards, 8-tab analytics (Overview + Latency live charts), placeholder tabs | ✅ |
+| §8.4 | Agent List page: table + grid views, search, New Agent Wizard Path A (blank) + Path B (guided 5-step) | ✅ |
+| §8.5 | Agent Config Module: all 10 tabs (Agent/Workflow/Branches/KB/Analysis/Tools/Tests/Widget/Security/Advanced) | ✅ |
+| §8.6 | Voice Picker side sheet: search + provider/gender filters + preview playback | ✅ |
+| §8.7 | Voice Library page: grid view + provider/language filters + preview | ✅ |
+| §8.8 | Knowledge Base global page: upload/URL/text + table + status badges | ✅ |
+| §8.9 | Tools global page: Tools + MCP sub-tabs; system tools table; per-tool CRUD | ✅ |
+| §8.10 | `npm run build` passes: 9 routes compiled, 0 TypeScript errors | ✅ |
+
+**Key spec compliance notes:**
+- Agent Tab: LLM picker grouped by provider (22 models), latency/cost display, Backup LLM 3-way, Temperature slider, Thinking Budget toggle, Limit token usage, Expressive Mode feature card, Hinglish Mode toggle, voice sliders (stability/similarity/style/speed)
+- Workflow Tab: dot-grid canvas, dnd-kit drag-and-drop nodes, 4 template names, Prevent infinite loops toggle
+- Tools Tab: system tool name is "Play keypad touch tone" (NOT "Play DTMF") — confirmed live on ElevenLabs
+- Widget Tab: Orb|Link|Image 3-way avatar, Feedback collection (ON default), Expanded behavior dropdown, allowed domains with red warning when empty
+- Security Tab: Guardrails Alpha (Focus + Manipulation), 8 Override toggles, Post-call Webhook, Allowlist with red warning
+- Advanced Tab: Filter background speech (Alpha), Eagerness 3-way, Speculative turn, Soft timeout field
+- Agent page header: Live N% badge + Public/Draft toggle + Variables button — per §6.4
 
 **Pre-Task 8 prerequisites:** ALL CLEARED ✅
+
+### TASK 9 ← NEXT
+- Conversational AI Agent runtime (turn loop, STT → LLM → TTS, barge-in, session manager)
 
 ### [2026-04-11] Task Addendum Blockers — RESOLVED
 | # | Blocker | Status | Notes |
