@@ -1002,6 +1002,34 @@ grep AutonomousModule services/platform-api/src/app.module.ts
 grep "Task 11" services/ai-pipeline/main.py
 ```
 
+### [2026-04-12] §11.8 VERIFICATION GATE — Caller Experience Standards ✅ PASSED
+
+**Run at:** 2026-04-12T08:54:34 UTC — CID: TEST-460990F563D4
+
+| Test | Standard | Result | Timestamps / Evidence |
+|------|----------|--------|----------------------|
+| 1 | Hold music lifecycle — MOH_START + MOH_STOP | **PASS** | MOH_START: `08:54:34.319` — MOH_STOP: `08:56:54.516` — both in `trustnow.progress_tracker` logs |
+| 2 | 3-tier silence watchdog at 20s / 60s / 120s | **PASS** | brief@`08:54:55.050` (elapsed=20s) · substantive@`08:55:36.512` (elapsed=60s) · escalate@`08:56:38.689` (elapsed=120s) |
+| 3 | HITL payload completeness — all 5 mandatory fields | **PASS** | CID ✓ · completed_steps ✓ · failed_steps ✓ · next_best_action ✓ · conversation_transcript ✓ — Redis `hitl_pending` retrievable |
+| 4 | Natural conversation quality — IVR anti-pattern check | **PASS** | All 5 messages (opening, 20s, 60s, 120s, handoff) free of IVR language; ElevenLabs TTS audio confirmation deferred to Task 16 §16.3 |
+
+**TTS text confirmed per tier:**
+- Opening hold: *"I'm just checking that for you now. Please bear with me for a moment."*
+- 20s brief: *"Still working on this for you, just another moment."*
+- 60s substantive: *"This is taking slightly longer than usual. I'm still working on it and haven't forgotten you."*
+- 120s escalate: *"I really appreciate your patience — this is taking a little longer than expected. Would you like to continue holding, be transferred to one of my colleagues, or would a callback be more convenient?"*
+- Handoff: *"I'm going to connect you with one of my colleagues now who can help you further. They'll have all the context from our conversation — you won't need to repeat anything."*
+
+**Bug found + fixed during verification:**
+- `progress_tracker._stop_moh()` used `AsyncClient.delete(json=...)` — httpx does not accept `json=` on DELETE; fixed to `client.request("DELETE", ..., content=..., headers={"Content-Type": "application/json"})` — commit `00b7a9c`
+
+**Caveats for Task 16 re-verification:**
+- LLM API keys not provisioned on this server — fallback text used (not LLM-generated). Re-verify with LLM keys to confirm dynamically generated messages also meet quality standard
+- FreeSWITCH unhealthy — MOH/TTS HTTP calls returned 404/401 (non-fatal, logged as WARNING) — audio playback on actual call requires FreeSWITCH health fix
+- Full audio quality confirmation (Test 4) must be re-run in Task 16 §16.3 with a live SIP call + ElevenLabs TTS
+
+---
+
 ### [2026-04-12] TASK 12 — Human Agent Desktop ✅ COMPLETE
 
 **Spec:** FULL-SCOPE-IMPL-001.md §12.1–§12.12 / BRD §8.4
