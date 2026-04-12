@@ -51,6 +51,7 @@ import session_manager
 import turn_loop
 import silence_watchdog
 import evaluation_service
+import tool_executor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("trustnow.ai_pipeline")
@@ -127,7 +128,9 @@ async def startup():
     silence_watchdog.set_pg_conn_params(_pg_conn_params)
     evaluation_service.set_redis(_redis)
     evaluation_service.set_pg_conn_params(_pg_conn_params)
-    logger.info("Turn-loop modules initialised (session_manager, turn_loop, silence_watchdog, evaluation_service)")
+    tool_executor.set_redis(_redis)
+    tool_executor.set_pg_conn_params(_pg_conn_params)
+    logger.info("Turn-loop modules initialised (session_manager, turn_loop, silence_watchdog, evaluation_service, tool_executor)")
 
 
 @app.on_event("shutdown")
@@ -252,6 +255,15 @@ class SessionStartRequest(BaseModel):
     evaluation_criteria_json: list = Field(default_factory=list)
     data_collection_json: list = Field(default_factory=list)
     post_call_webhook_url: Optional[str] = None
+
+
+class ToolInvokeRequest(BaseModel):
+    """Direct tool invocation during an active session — Task 10."""
+    tool_id: str
+    tool_name: str
+    tool_type: str = "webhook"           # "webhook" | "system" | "mcp" | "client"
+    input_params: dict = Field(default_factory=dict)
+    turn_number: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -446,6 +458,38 @@ async def session_start(cid: str, body: SessionStartRequest):
     )
 
     return {"cid": cid, "status": "starting", "channel_uuid": body.channel_uuid}
+
+
+@app.post("/session/{cid}/tool-invoke")
+async def session_tool_invoke(cid: str, body: ToolInvokeRequest):
+    """
+    Direct tool invocation during an active session — Task 10.
+    Called from the turn loop or directly for testing.
+    Returns tool execution result including success flag.
+    """
+    logger.info("[%s] POST /session/tool-invoke — tool=%s type=%s", cid, body.tool_name, body.tool_type)
+
+    session = await _redis.hgetall(f"session:{cid}")
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {cid} not found")
+
+    agent_config = {
+        "agent_id": session.get("agent_id", ""),
+        "tenant_id": session.get("tenant_id", ""),
+        "partition": session.get("partition", "cloud"),
+        "channel": session.get("channel", "sip"),
+    }
+
+    result = await tool_executor.execute_tool(
+        cid=cid,
+        tool_id=body.tool_id,
+        tool_name=body.tool_name,
+        tool_type=body.tool_type,
+        input_params=body.input_params,
+        agent_config=agent_config,
+        turn_number=body.turn_number,
+    )
+    return {"cid": cid, **result}
 
 
 @app.post("/session/{cid}/end")

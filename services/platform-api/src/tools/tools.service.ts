@@ -6,13 +6,38 @@ import { AuditService } from '../audit/audit.service';
 export class ToolsService {
   constructor(private audit: AuditService) {}
 
-  async findAll(tenantId: string, agentId?: string) {
+  async findAll(tenantId: string, agentId?: string, scope?: string) {
     const pool = getPool();
+    // scope=workspace — all tools across all agents in this tenant (§6.2J EXCEED)
+    if (scope === 'workspace') {
+      const { rows } = await pool.query(
+        `SELECT t.*, u.email AS created_by_email
+         FROM tools t
+         LEFT JOIN users u ON u.user_id::text = t.created_by
+         WHERE t.tenant_id = $1 AND t.type != 'mcp'
+         ORDER BY t.created_at DESC`,
+        [tenantId],
+      );
+      return rows;
+    }
     let query = `SELECT * FROM tools WHERE tenant_id = $1 AND type != 'mcp'`;
     const params: any[] = [tenantId];
     if (agentId) { query += ` AND agent_id = $2`; params.push(agentId); }
     query += ` ORDER BY created_at DESC`;
     const { rows } = await pool.query(query, params);
+    return rows;
+  }
+
+  // Returns tools with full config_json — used by AI pipeline tool executor at runtime
+  async findAllWithConfig(tenantId: string, agentId: string) {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT tool_id, name, type, description, config_json
+       FROM tools
+       WHERE tenant_id = $1 AND agent_id = $2 AND type != 'mcp'
+       ORDER BY created_at DESC`,
+      [tenantId, agentId],
+    );
     return rows;
   }
 
@@ -28,12 +53,51 @@ export class ToolsService {
 
   async create(tenantId: string, dto: any, actorId: string) {
     const pool = getPool();
+    // Build config_json from both flat §6.2J fields and any explicit config_json
+    const configJson = {
+      ...(dto.config_json || {}),
+      // Webhook fields (§6.2J CreateToolDto)
+      ...(dto.method !== undefined && { method: dto.method }),
+      ...(dto.url !== undefined && { url: dto.url }),
+      ...(dto.auth_connection_id !== undefined && { auth_connection_id: dto.auth_connection_id }),
+      ...(dto.headers !== undefined && { headers: dto.headers }),
+      ...(dto.response_timeout_s !== undefined && { response_timeout_s: dto.response_timeout_s }),
+      // Client fields
+      ...(dto.wait_for_response !== undefined && { wait_for_response: dto.wait_for_response }),
+      // All types
+      ...(dto.disable_interruptions !== undefined && { disable_interruptions: dto.disable_interruptions }),
+      ...(dto.pre_tool_speech !== undefined && { pre_tool_speech: dto.pre_tool_speech }),
+      ...(dto.execution_mode !== undefined && { execution_mode: dto.execution_mode }),
+      ...(dto.tool_call_sound !== undefined && { tool_call_sound: dto.tool_call_sound }),
+      ...(dto.input_schema !== undefined && { input_schema: dto.input_schema }),
+      ...(dto.dynamic_variable_assignments !== undefined && { dynamic_variable_assignments: dto.dynamic_variable_assignments }),
+      ...(dto.response_mocks !== undefined && { response_mocks: dto.response_mocks }),
+      // MCP server fields
+      ...(dto.server_url !== undefined && { server_url: dto.server_url }),
+      ...(dto.server_type !== undefined && { server_type: dto.server_type }),
+    };
+
     const { rows } = await pool.query(
-      `INSERT INTO tools (tenant_id, name, type, description, config_json, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [tenantId, dto.name, dto.type || 'webhook', dto.description || '',
-       JSON.stringify(dto.config_json || {}), actorId],
+      `INSERT INTO tools (tenant_id, agent_id, name, type, description, config_json, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [tenantId, dto.agent_id || null, dto.name, dto.type || 'webhook',
+       dto.description || '', JSON.stringify(configJson), actorId],
     );
+
+    // Append tool_id to agent_configs.tools_config_json.attached_tool_ids (§6.2J side effect)
+    if (dto.agent_id) {
+      await pool.query(
+        `UPDATE agent_configs
+         SET tools_config_json = jsonb_set(
+           COALESCE(tools_config_json, '{}'::jsonb),
+           '{attached_tool_ids}',
+           COALESCE(tools_config_json->'attached_tool_ids', '[]'::jsonb) || $1::jsonb
+         )
+         WHERE agent_id = $2`,
+        [JSON.stringify(rows[0].tool_id), dto.agent_id],
+      );
+    }
+
     await this.audit.log({
       tenant_id: tenantId, actor_id: actorId,
       action: 'tool.create', resource_type: 'tool', resource_id: rows[0].tool_id,
@@ -66,12 +130,39 @@ export class ToolsService {
 
   async delete(tenantId: string, toolId: string, actorId: string) {
     const pool = getPool();
+    // Fetch agent_id before deletion for side effect cleanup
+    const { rows: existing } = await pool.query(
+      'SELECT agent_id FROM tools WHERE tenant_id = $1 AND tool_id = $2',
+      [tenantId, toolId],
+    );
+    const agentId = existing[0]?.agent_id;
+
     await pool.query('DELETE FROM tools WHERE tenant_id = $1 AND tool_id = $2', [tenantId, toolId]);
+
+    // Remove tool_id from agent_configs.tools_config_json.attached_tool_ids — §6.2J side effect
+    if (agentId) {
+      await pool.query(
+        `UPDATE agent_configs
+         SET tools_config_json = jsonb_set(
+           COALESCE(tools_config_json, '{}'::jsonb),
+           '{attached_tool_ids}',
+           COALESCE(
+             (SELECT jsonb_agg(elem)
+              FROM jsonb_array_elements(COALESCE(tools_config_json->'attached_tool_ids', '[]'::jsonb)) AS elem
+              WHERE elem::text != $1::jsonb::text),
+             '[]'::jsonb
+           )
+         )
+         WHERE agent_id = $2`,
+        [JSON.stringify(toolId), agentId],
+      );
+    }
+
     await this.audit.log({
       tenant_id: tenantId, actor_id: actorId,
       action: 'tool.delete', resource_type: 'tool', resource_id: toolId,
     });
-    return { success: true };
+    return { deleted: true };
   }
 
   // System tools for an agent (includes "Play keypad touch tone" per UI-SPEC Tab 6)

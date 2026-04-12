@@ -17,9 +17,13 @@ export class ToolsController {
 
   @Get()
   @Roles('agent_admin', 'operator', 'supervisor', 'tenant_admin', 'platform_admin')
-  @ApiOperation({ summary: 'List tools — ?agent_id=:id or ?scope=workspace' })
-  findAll(@TenantId() tid: string, @Query('agent_id') agentId?: string) {
-    return this.service.findAll(tid, agentId);
+  @ApiOperation({ summary: 'List tools — ?agent_id=:id or ?scope=workspace (§6.2J EXCEED)' })
+  findAll(
+    @TenantId() tid: string,
+    @Query('agent_id') agentId?: string,
+    @Query('scope') scope?: string,
+  ) {
+    return this.service.findAll(tid, agentId, scope);
   }
 
   @Get('system')

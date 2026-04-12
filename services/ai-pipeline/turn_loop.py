@@ -1,18 +1,24 @@
 """
-TRUSTNOW AI Pipeline — Turn Loop — BRD §9.1 Path 2
-====================================================
+TRUSTNOW AI Pipeline — Turn Loop — BRD §9.1 Path 2 / Task 10
+==============================================================
 Implements the full per-turn conversation pipeline:
-  STT → RAG (optional) → LLM → TTS → audio output
+  STT → RAG (optional) → LLM → [Tool Call Loop] → TTS → audio output
+
+Task 10 additions:
+  - build_llm_tools_schema() — convert agent tools to OpenAI function calling format
+  - _handle_llm_tool_calls() — detect tool_calls in LLM response, execute, re-prompt LLM
+  - Multi-step tool resolution: LLM → tool call → result inject → LLM → TTS (up to 5 loops)
 
 Barge-in: subscribes to Redis interrupt:{cid} pub/sub channel per turn.
 Speculative turn: starts LLM generation when VAD confidence > 0.7 (§9.9).
 
 Functions:
-  handle_user_turn()        — main entry — called on VAD end-of-speech
-  barge_in_listener()       — checks interrupt:{cid} channel, honours interrupt mode
-  build_llm_messages()      — build OpenAI-format message array from transcript
-  play_agent_turn()         — TTS synthesis + barge-in-aware streaming
-  execute_platform_handoff()— triggers handoff via handoff_service.py
+  handle_user_turn()         — main entry — called on VAD end-of-speech
+  build_llm_tools_schema()   — fetch agent tools + build OpenAI function calling array
+  _handle_llm_tool_calls()   — execute tool calls, inject results, loop back to LLM
+  build_llm_messages()       — build OpenAI-format message array from transcript
+  play_agent_turn()          — TTS synthesis + barge-in-aware streaming
+  execute_platform_handoff() — triggers handoff via handoff_service.py
 """
 
 import asyncio
@@ -145,7 +151,7 @@ async def handle_user_turn(cid: str, audio_bytes: bytes, agent_config: dict) -> 
         except Exception as exc:
             logger.warning("[%s] RAG retrieval failed (non-fatal): %s", cid, exc)
 
-    # ── STAGE 3: LLM Completion ───────────────────────────────────────────────
+    # ── STAGE 3: LLM Completion (with tool calling schema) ───────────────────
     raw_transcript = await _redis.hget(f"session:{cid}", "transcript")
     full_transcript = json.loads(raw_transcript) if raw_transcript else []
     messages = build_llm_messages(
@@ -154,7 +160,12 @@ async def handle_user_turn(cid: str, audio_bytes: bytes, agent_config: dict) -> 
         rag_context=rag_context,
     )
 
+    # Build tools schema for function calling — Task 10
+    from tool_executor import build_tools_schema
+    tools_schema = await build_tools_schema(agent_config)
+
     t_llm_start = time.monotonic()
+    turn_number = int(session.get("turn_count", 0)) + 1
     try:
         llm_response = await _llm_complete(
             messages=messages,
@@ -165,6 +176,7 @@ async def handle_user_turn(cid: str, audio_bytes: bytes, agent_config: dict) -> 
             cid=cid,
             tenant_id=agent_config["tenant_id"],
             partition=agent_config.get("partition", "cloud"),
+            tools=tools_schema if tools_schema else None,
         )
     except Exception as exc:
         logger.error("[%s] LLM error: %s", cid, exc)
@@ -172,13 +184,26 @@ async def handle_user_turn(cid: str, audio_bytes: bytes, agent_config: dict) -> 
         return
 
     llm_latency_ms = int((time.monotonic() - t_llm_start) * 1000)
-    agent_turn_text = llm_response.get("content", "")
-    logger.info("[%s] LLM: %dms — '%s'", cid, llm_latency_ms, agent_turn_text[:80])
 
     # Record LLM cost
     llm_cost = llm_response.get("cost_usd", 0.0)
     await _redis.hincrbyfloat(f"session:{cid}", "llm_cost_usd", llm_cost)
     await _redis.hincrby(f"session:{cid}", "llm_turns", 1)
+
+    # ── STAGE 3b: Tool Call Loop (Task 10) ───────────────────────────────────
+    # If LLM returns tool_calls, execute them and re-prompt until text response
+    agent_turn_text, tool_loop_cost = await _handle_llm_tool_calls(
+        cid=cid,
+        llm_response=llm_response,
+        messages=messages,
+        agent_config=agent_config,
+        tools_schema=tools_schema,
+        turn_number=turn_number,
+    )
+    if tool_loop_cost:
+        await _redis.hincrbyfloat(f"session:{cid}", "llm_cost_usd", tool_loop_cost)
+
+    logger.info("[%s] LLM: %dms — '%s'", cid, llm_latency_ms, agent_turn_text[:80])
 
     # Check handoff conditions BEFORE generating TTS (§7.12)
     from handoff_service import check_handoff_conditions
@@ -397,33 +422,56 @@ async def _llm_complete(
     backup_model: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 512,
+    tools: Optional[list[dict]] = None,
 ) -> dict:
     """
     Call LiteLLM proxy at :4000 with fallback to backup_model if primary fails.
-    Returns dict with 'content' and 'cost_usd'.
+    Passes tools schema for function calling when provided (Task 10).
+    Returns dict with 'content', 'cost_usd', and optionally 'tool_calls'.
     """
     litellm_url = "http://127.0.0.1:4000"
 
     async def _call(m: str) -> dict:
+        payload: dict = {
+            "model": m,
+            "messages": messages,
+            "max_tokens": max_tokens if max_tokens > 0 else None,
+            "temperature": temperature,
+        }
+        # Attach tools schema for function calling — Task 10
+        if tools:
+            # Strip internal metadata (_tool_id, _tool_type) before sending to LLM
+            clean_tools = []
+            for t in tools:
+                fn = dict(t.get("function", {}))
+                fn.pop("_tool_id", None)
+                fn.pop("_tool_type", None)
+                clean_tools.append({"type": "function", "function": fn})
+            payload["tools"] = clean_tools
+            payload["tool_choice"] = "auto"
+
         async with httpx.AsyncClient(timeout=45.0) as client:
             resp = await client.post(
                 f"{litellm_url}/v1/chat/completions",
-                json={
-                    "model": m,
-                    "messages": messages,
-                    "max_tokens": max_tokens if max_tokens > 0 else None,
-                    "temperature": temperature,
-                },
+                json=payload,
                 headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
             data = resp.json()
-            return {
-                "content": data["choices"][0]["message"]["content"],
-                "model": data.get("model", m),
-                "cost_usd": float(data.get("_response_cost", 0.0)),
-                "usage": data.get("usage", {}),
-            }
+
+        msg = data["choices"][0]["message"]
+        result = {
+            "content": msg.get("content") or "",
+            "model": data.get("model", m),
+            "cost_usd": float(data.get("_response_cost", 0.0)),
+            "usage": data.get("usage", {}),
+            "finish_reason": data["choices"][0].get("finish_reason", "stop"),
+        }
+        # Include tool_calls if present (LLM requesting tool execution)
+        if msg.get("tool_calls"):
+            result["tool_calls"] = msg["tool_calls"]
+            result["assistant_message"] = msg  # full message for context injection
+        return result
 
     try:
         return await _call(model)
@@ -433,6 +481,133 @@ async def _llm_complete(
             logger.info("[%s] Falling back to backup LLM '%s'", cid, backup_model)
             return await _call(backup_model)
         raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool call loop — Task 10
+# Resolves LLM tool_calls → execution → result injection → re-prompt
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _handle_llm_tool_calls(
+    cid: str,
+    llm_response: dict,
+    messages: list[dict],
+    agent_config: dict,
+    tools_schema: list[dict],
+    turn_number: int,
+    max_iterations: int = 5,
+) -> tuple[str, float]:
+    """
+    Process tool_calls from LLM response in a loop until a text response is returned.
+    Max 5 iterations to prevent infinite tool call loops.
+
+    Returns (final_text_response, total_tool_loop_llm_cost).
+    """
+    from tool_executor import execute_tool
+
+    total_cost = 0.0
+    current_response = llm_response
+    working_messages = list(messages)
+
+    for iteration in range(max_iterations):
+        tool_calls = current_response.get("tool_calls")
+        if not tool_calls:
+            # LLM returned a text response — we're done
+            return current_response.get("content", ""), total_cost
+
+        finish_reason = current_response.get("finish_reason", "stop")
+        if finish_reason not in ("tool_calls", "function_call"):
+            # No more tool calls needed
+            return current_response.get("content", ""), total_cost
+
+        logger.info("[%s] Tool call iteration %d — %d tool(s) to execute",
+                    cid, iteration + 1, len(tool_calls))
+
+        # Append the assistant's tool_calls message to working context
+        assistant_msg = current_response.get("assistant_message", {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": tool_calls,
+        })
+        working_messages.append(assistant_msg)
+
+        # Build a lookup from function name → tool schema metadata
+        tool_meta: dict[str, dict] = {}
+        for t in tools_schema:
+            fn = t.get("function", {})
+            tool_meta[fn.get("name", "")] = {
+                "tool_id": fn.get("_tool_id", ""),
+                "tool_type": fn.get("_tool_type", "webhook"),
+            }
+
+        # Execute each tool call and collect results
+        tool_results = []
+        for tc in tool_calls:
+            fn_name = tc.get("function", {}).get("name", "")
+            call_id = tc.get("id", f"call_{fn_name}_{iteration}")
+
+            try:
+                raw_args = tc.get("function", {}).get("arguments", "{}")
+                input_params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                input_params = {}
+
+            meta = tool_meta.get(fn_name, {"tool_id": fn_name, "tool_type": "system"})
+            tool_id = meta["tool_id"]
+            tool_type = meta["tool_type"]
+
+            logger.info("[%s] Executing tool: %s (type=%s id=%s)", cid, fn_name, tool_type, tool_id)
+            exec_result = await execute_tool(
+                cid=cid,
+                tool_id=tool_id,
+                tool_name=fn_name,
+                tool_type=tool_type,
+                input_params=input_params,
+                agent_config=agent_config,
+                turn_number=turn_number,
+            )
+
+            tool_result_content = json.dumps(exec_result.get("result", {}))
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": tool_result_content,
+            })
+
+            # Publish tool invocation to Redis for real-time frontend display
+            await _redis.publish(f"transcript:{cid}", json.dumps({
+                "event": "tool_invocation",
+                "cid": cid,
+                "tool_name": fn_name,
+                "tool_id": tool_id,
+                "success": exec_result.get("success", False),
+                "result_preview": tool_result_content[:200],
+            }))
+
+        # Inject tool results into message context
+        working_messages.extend(tool_results)
+
+        # Re-prompt LLM with tool results — get next response
+        try:
+            current_response = await _llm_complete(
+                messages=working_messages,
+                model=agent_config.get("llm_model", "gpt-4o-mini"),
+                backup_model=agent_config.get("backup_llm_model"),
+                temperature=float(agent_config.get("llm_temperature", 0.7)),
+                max_tokens=int(agent_config.get("llm_max_tokens", 512)),
+                cid=cid,
+                tenant_id=agent_config["tenant_id"],
+                partition=agent_config.get("partition", "cloud"),
+                tools=tools_schema if tools_schema else None,
+            )
+            total_cost += current_response.get("cost_usd", 0.0)
+        except Exception as exc:
+            logger.error("[%s] LLM re-prompt after tool call failed: %s", cid, exc)
+            return "I'm sorry, I encountered an issue processing that request.", total_cost
+
+    # Max iterations reached — return whatever content we have
+    logger.warning("[%s] Tool call loop hit max iterations (%d)", cid, max_iterations)
+    return current_response.get("content", ""), total_cost
 
 
 # ─────────────────────────────────────────────────────────────────────────────

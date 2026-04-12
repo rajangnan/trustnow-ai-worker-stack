@@ -935,8 +935,32 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 - **Speculative turn** (§9.9): `asyncio.create_task(llm_complete(...))` when `vad_confidence > 0.7` (wired in VAD layer)
 - **Post-call pipeline**: evaluation_service runs as background task after flush — non-fatal; results written to PostgreSQL + Redis
 
-### TASK 10 ← NEXT
-- Tools-Assisted AI Agents (BRD §6.2) — Prerequisite: Task 9 complete ✅
+### [2026-04-12] TASK 10 — Tools-Assisted AI Agents ✅ COMPLETE
+
+**Spec:** FULL-SCOPE-IMPL-001.md §10.1–§10.3 / BRD §6.2
+
+| Step | File | Description | Status |
+|------|------|-------------|--------|
+| 10.1 | `services/ai-pipeline/tool_executor.py` | Tool execution engine: webhook (idempotency + retry + circuit breaker), system tools (end_call/detect_language/skip_turn/transfer/play_dtmf/voicemail), MCP, client-side; Vault credential fetch; {{env.VAR}}/{{secret.NAME}} template resolution; audit log; §10.3 agent scope validation | ✅ |
+| 10.2 | `services/ai-pipeline/turn_loop.py` | LLM tool calling schema build; `_handle_llm_tool_calls()` loop (max 5 iterations); tool results injected as `role:tool` messages; Redis tool_invocation event for frontend | ✅ |
+| 10.3 | `services/platform-api/src/telephony/telephony.controller.ts` | Internal endpoints: POST /api/telephony/hangup (ESL hangup), play_audio, play_audio_chunk, stop_audio, play_dtmf | ✅ |
+| 10.4 | `services/platform-api/src/telephony/telephony.module.ts` | Register TelephonyController | ✅ |
+| 10.5 | `services/platform-api/src/tools/tools.service.ts` | scope=workspace query, findAllWithConfig() for runtime, create() merges §6.2J flat fields into config_json + appends to attached_tool_ids, delete() removes from attached_tool_ids | ✅ |
+| 10.6 | `services/platform-api/src/tools/tools.controller.ts` | ?scope query param wired through | ✅ |
+| 10.7 | `services/ai-pipeline/main.py` | Inject tool_executor at startup; POST /session/{cid}/tool-invoke endpoint (ToolInvokeRequest) | ✅ |
+
+**Key implementation notes:**
+- **Idempotency key** (§10.2): `X-Idempotency-Key: {cid}-{tool_id}-{turn_number}` on every webhook POST/PUT/PATCH
+- **Retry policy** (§10.2): max 3 attempts, 1s→2s→4s backoff ±200ms jitter; retry on timeout/429/503; no retry on 400/401/403/404
+- **Circuit breaker** (§10.2): per-tool Redis key `circuit:{tool_id}:state`; >50% failures in 60s → open 120s; cached last-good result returned while open
+- **Tool call loop**: LLM → tool_calls detected → execute each → inject `role:tool` results → re-prompt LLM → repeat max 5 iterations until text response → TTS
+- **System tools**: `end_conversation` → `platform_end_call()` async task; `transfer_to_agent/number` → `execute_handoff()` async task; `play_keypad_touch_tone` → ESL send_dtmf
+- **Credentials**: fetched from Vault `secret/trustnow/{tenant_id}/tools/{tool_id}/credentials` at execution time — never cached (§10.2)
+- **Tenant + agent scope** (§10.3): `_validate_agent_scope()` checks tool is in `agent_configs.tools_config_json.attached_tool_ids` before execution
+- **Workspace tool library** (§6.2J EXCEED): `GET /tools?scope=workspace` returns all tenant tools with creator email
+
+### TASK 11 ← NEXT
+- Fully Autonomous AI Workers (BRD §6.3) — Prerequisite: Task 10 complete ✅
 
 ### [2026-04-11] Task Addendum Blockers — RESOLVED
 | # | Blocker | Status | Notes |
