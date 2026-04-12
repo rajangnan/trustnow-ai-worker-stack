@@ -959,8 +959,51 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 - **Tenant + agent scope** (§10.3): `_validate_agent_scope()` checks tool is in `agent_configs.tools_config_json.attached_tool_ids` before execution
 - **Workspace tool library** (§6.2J EXCEED): `GET /tools?scope=workspace` returns all tenant tools with creator email
 
-### TASK 11 ← NEXT
-- Fully Autonomous AI Workers (BRD §6.3) — Prerequisite: Task 10 complete ✅
+### [2026-04-12] TASK 11 — Fully Autonomous AI Workers ✅ COMPLETE
+
+**Spec:** FULL-SCOPE-IMPL-001.md §11.1–§11.8 / BRD §6.3
+
+| Step | File | Description | Status |
+|------|------|-------------|--------|
+| 11.1 | `services/ai-pipeline/master_worker.py` | Master AI Worker: 10-step orchestration engine (Greeting→Intent→Auth→Eligibility→Dues→Payment→Delegation→Progress→Consolidation→Response); crash-resume via Redis saga state; handoff on halt | ✅ |
+| 11.2 | `services/ai-pipeline/sme_worker.py` | SME domain workers: Billing, Provisioning, Technical Support, Banking, Retail, Healthcare; per-domain Qdrant KB, system prompt, tool set, LLM context; `requires_human_approval`/`requires_payment` flags; tool calling + RAG in each domain | ✅ |
+| 11.3 | `services/ai-pipeline/auth_policy.py` | Auth Policy Engine: OTP-SMS/email, ANI/DNIS, PIN, KBA, webhook, biometric, SSO; Redis-cached policy (60s); `authenticate_caller()` dispatcher; `verify_otp()/verify_pin()/verify_kba()` for turn-loop integration | ✅ |
+| 11.4 | `services/ai-pipeline/payment_gateway.py` | Payment Gating: dispatch link to tenant payment webhook; SMS link delivery; Redis `payment_status:{cid}` polling (configurable timeout); `cancel_payment()`; exponential backoff retry on dispatch failure | ✅ |
+| 11.5 | `services/ai-pipeline/hitl_service.py` | HITL Approvals: Kafka `hitl_approval_required` publish; Redis `hitl_decision:{cid}` polling (120s default); `is_hitl_required()` threshold check; `resolve_hitl()` for NestJS callback; `get_pending_hitl()` for supervisor UI | ✅ |
+| 11.6 | `services/ai-pipeline/saga_orchestrator.py` | Saga/Compensation: sequential + parallel step execution; rollback/skip/halt/retry strategies; idempotency token `{CID}-{step}-{domain}`; Redis crash-resume (`session:{cid}.saga_completed_steps`); `save/load_step_result()` per domain | ✅ |
+| 11.7 | `services/ai-pipeline/progress_tracker.py` | Caller Progress Updates: MOH control (moh_start/stop); asyncio progress loop per CID; LLM-generated updates every 20s; substantive message at 60s; escalating offer (wait/transfer/callback) at 120s; `update_progress()` for Master Worker step completion notifications | ✅ |
+| 11.8 | `services/platform-api/src/autonomous/hitl.controller.ts` | NestJS HITL controllers: `HitlController` (supervisor approve/reject — JWT-protected, roles: supervisor/admin); `PaymentWebhookController` (payment provider callback); `HitlInternalController` (AI pipeline internal resolve) | ✅ |
+| 11.9 | `services/platform-api/src/autonomous/autonomous.module.ts` | NestJS AutonomousModule: registers all 3 HITL controllers + AuditModule | ✅ |
+| 11.10 | `services/platform-api/src/app.module.ts` | Register AutonomousModule | ✅ |
+| 11.11 | `services/ai-pipeline/main.py` | Inject all Task 11 modules at startup; new endpoints: POST /session/{cid}/autonomous, POST /session/{cid}/hitl-resolve, POST /session/{cid}/payment-status; AutonomousSessionRequest, HitlResolveRequest Pydantic models | ✅ |
+
+**Key implementation notes:**
+- **Master Worker 10 steps**: Intent Capture (LLM structured JSON) → Auth (delegated to auth_policy) → Eligibility webhook → Dues check webhook → Payment gating → SME saga → Progress MOH → Result consolidation (LLM summary) → Final TTS response
+- **Crash-resume**: `get_saga_state()` on startup; intent + domains + completed indices all persisted in Redis so a pod restart resumes from last completed step using same idempotency tokens
+- **HITL flow**: Master Worker suspends SME task → publishes Kafka `hitl_approval_required` → holds in Redis poll loop → supervisor clicks Approve/Reject in Agent Desktop → NestJS writes `hitl_decision:{CID}` → Master Worker unblocks
+- **Payment flow**: Platform API `POST /api/payments/webhook` (NestJS) receives provider callback → writes `payment_status:{cid}` → `payment_gateway._await_payment_completion()` unblocks
+- **Progress updates**: asyncio task per CID; brief (20s), substantive (60s), escalating (120s) LLM-generated messages; always references actual task being processed — not generic text
+- **SME domains**: 6 built-in (billing, provisioning, technical_support, banking, retail, healthcare); each has own Qdrant collection, system prompt with domain-specific HITL/payment triggers, and tool domain filter
+- **Saga idempotency**: `{CID}-{step_number}-{sme_domain}` token passed to every SME task and to external systems via tool webhook headers — ensures no double-execution on retry
+- **Internal endpoints** (SkipAuth): `/api/payments/webhook`, `/_internal/hitl/:cid/resolve` bypass JWT — internal only
+
+**VERIFY:**
+```bash
+# Check all Task 11 Python files present
+ls services/ai-pipeline/{auth_policy,payment_gateway,hitl_service,saga_orchestrator,progress_tracker,sme_worker,master_worker}.py
+
+# Check NestJS autonomous module
+ls services/platform-api/src/autonomous/
+
+# Check app.module.ts has AutonomousModule
+grep AutonomousModule services/platform-api/src/app.module.ts
+
+# Check main.py has Task 11 startup injections
+grep "Task 11" services/ai-pipeline/main.py
+```
+
+### TASK 12 ← NEXT
+- Human Agent Desktop (BRD §8.4) — Prerequisite: Task 11 complete ✅
 
 ### [2026-04-11] Task Addendum Blockers — RESOLVED
 | # | Blocker | Status | Notes |

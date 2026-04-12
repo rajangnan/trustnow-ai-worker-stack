@@ -52,6 +52,14 @@ import turn_loop
 import silence_watchdog
 import evaluation_service
 import tool_executor
+# Task 11 — Autonomous AI Worker modules
+import auth_policy
+import payment_gateway
+import hitl_service
+import saga_orchestrator
+import progress_tracker
+import sme_worker
+import master_worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("trustnow.ai_pipeline")
@@ -131,6 +139,19 @@ async def startup():
     tool_executor.set_redis(_redis)
     tool_executor.set_pg_conn_params(_pg_conn_params)
     logger.info("Turn-loop modules initialised (session_manager, turn_loop, silence_watchdog, evaluation_service, tool_executor)")
+
+    # Task 11 — Autonomous AI Worker modules
+    auth_policy.set_redis(_redis)
+    payment_gateway.set_redis(_redis)
+    hitl_service.set_redis(_redis)
+    saga_orchestrator.set_redis(_redis)
+    progress_tracker.set_redis(_redis)
+    progress_tracker.set_pg_conn_params(_pg_conn_params)
+    sme_worker.set_redis(_redis)
+    sme_worker.set_pg_conn_params(_pg_conn_params)
+    master_worker.set_redis(_redis)
+    master_worker.set_pg_conn_params(_pg_conn_params)
+    logger.info("Autonomous AI Worker modules initialised (Task 11)")
 
 
 @app.on_event("shutdown")
@@ -264,6 +285,22 @@ class ToolInvokeRequest(BaseModel):
     tool_type: str = "webhook"           # "webhook" | "system" | "mcp" | "client"
     input_params: dict = Field(default_factory=dict)
     turn_number: int = 0
+
+
+class AutonomousSessionRequest(BaseModel):
+    """Trigger autonomous AI Worker session after first message — Task 11."""
+    channel_uuid: str
+    caller_phone: Optional[str] = None
+    conversation_history: list = Field(default_factory=list)
+    internal_token: str = ""
+
+
+class HitlResolveRequest(BaseModel):
+    """Internal: write HITL decision — called from NestJS HITL controller — Task 11."""
+    decision: str                        # 'approve' | 'reject'
+    supervisor_id: str
+    supervisor_email: Optional[str] = None
+    notes: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -490,6 +527,85 @@ async def session_tool_invoke(cid: str, body: ToolInvokeRequest):
         turn_number=body.turn_number,
     )
     return {"cid": cid, **result}
+
+
+@app.post("/session/{cid}/autonomous")
+async def session_autonomous(cid: str, body: AutonomousSessionRequest):
+    """
+    Launch the Master AI Worker 10-step orchestration engine for this session.
+    Called by session_manager (or NestJS) after first-message delivery completes.
+    Runs as a fire-and-forget asyncio task — returns immediately.
+    """
+    logger.info("[%s] POST /session/autonomous", cid)
+
+    session = await _redis.hgetall(f"session:{cid}")
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {cid} not found")
+
+    agent_config = {
+        "agent_id": session.get("agent_id", ""),
+        "tenant_id": session.get("tenant_id", ""),
+        "partition": session.get("partition", "cloud"),
+        "channel": session.get("channel", "sip"),
+        "llm_model": session.get("llm_model", "gpt-4o"),
+        "voice_id": session.get("voice_id"),
+        "voice_personality": session.get("voice_personality", "professional and friendly"),
+        # Auth policy, payment, HITL, dues check configs loaded from session
+        "auth_policy": json.loads(session.get("auth_policy_json", "{}") or "{}"),
+        "payment_config": json.loads(session.get("payment_config_json", "{}") or "{}"),
+        "hitl_config": json.loads(session.get("hitl_config_json", "{}") or "{}"),
+        "dues_check": json.loads(session.get("dues_check_json", "{}") or "{}"),
+        "eligibility_check": json.loads(session.get("eligibility_check_json", "{}") or "{}"),
+        "sme_config": json.loads(session.get("sme_config_json", "{}") or "{}"),
+    }
+
+    asyncio.create_task(
+        master_worker.run_autonomous_session(
+            cid=cid,
+            tenant_id=session.get("tenant_id", ""),
+            agent_id=session.get("agent_id", ""),
+            channel_uuid=body.channel_uuid,
+            agent_config=agent_config,
+            caller_phone=body.caller_phone,
+            conversation_history=body.conversation_history,
+            internal_token=body.internal_token,
+        ),
+        name=f"master_worker:{cid}",
+    )
+
+    return {"cid": cid, "status": "autonomous_started"}
+
+
+@app.post("/session/{cid}/hitl-resolve")
+async def session_hitl_resolve(cid: str, body: HitlResolveRequest):
+    """
+    Write HITL supervisor decision to Redis — called from NestJS HITL controller.
+    AI Pipeline hitl_service.py polls hitl_decision:{cid} and picks up the decision.
+    """
+    logger.info("[%s] POST /session/hitl-resolve decision=%s", cid, body.decision)
+    if body.decision not in ("approve", "reject", "timeout"):
+        raise HTTPException(status_code=400, detail="decision must be approve|reject|timeout")
+    await hitl_service.resolve_hitl(
+        cid=cid,
+        decision=body.decision,
+        supervisor_id=body.supervisor_id,
+        supervisor_email=body.supervisor_email,
+        notes=body.notes,
+    )
+    return {"cid": cid, "decision_written": body.decision}
+
+
+@app.post("/session/{cid}/payment-status")
+async def session_payment_status(cid: str, body: dict):
+    """
+    Write payment completion status to Redis — called from NestJS PaymentWebhookController.
+    payment_gateway.py polls payment_status:{cid} to know when payment clears.
+    """
+    status = body.get("status", "completed")
+    if status not in ("completed", "failed", "cancelled"):
+        raise HTTPException(status_code=400, detail="status must be completed|failed|cancelled")
+    await _redis.setex(f"payment_status:{cid}", 360, status)
+    return {"cid": cid, "payment_status_written": status}
 
 
 @app.post("/session/{cid}/end")
