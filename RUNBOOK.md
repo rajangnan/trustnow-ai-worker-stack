@@ -1002,8 +1002,54 @@ grep AutonomousModule services/platform-api/src/app.module.ts
 grep "Task 11" services/ai-pipeline/main.py
 ```
 
-### TASK 12 ← NEXT
-- Human Agent Desktop (BRD §8.4) — Prerequisite: Task 11 complete ✅
+### [2026-04-12] TASK 12 — Human Agent Desktop ✅ COMPLETE
+
+**Spec:** FULL-SCOPE-IMPL-001.md §12.1–§12.12 / BRD §8.4
+
+| Step | File | Description | Status |
+|------|------|-------------|--------|
+| 12.1 | `services/platform-api/src/desktop/desktop.gateway.ts` | NestJS WebSocket Gateway (`/desktop` namespace): Redis pub/sub bridge (handoff:incoming, hitl:approval_required, agent:status_changed, transcript updates); client handlers: call:join/leave, agent:set_status, supervisor:get_team | ✅ |
+| 12.2 | `services/platform-api/src/desktop/desktop.controller.ts` | REST controller at `/desktop`: queue (list/accept), context fetch, team list, agent status PUT, call controls (hold/unhold/mute/unmute/end/transfer/barge/whisper), call history, disposition POST, recording GET, KB search | ✅ |
+| 12.3 | `services/platform-api/src/desktop/desktop.module.ts` | NestJS DesktopModule registering DesktopController + DesktopGateway | ✅ |
+| 12.4 | `services/platform-api/src/app.module.ts` | Register DesktopModule; `npm install @nestjs/websockets @nestjs/platform-socket.io socket.io --legacy-peer-deps` | ✅ |
+| 12.5 | `services/frontend/src/store/desktopStore.ts` | Zustand store: AgentStatus, ActiveCall (transcript, on_hold, muted, channel_uuid), QueueItem, HitlRequest, TeamMember; full action set (queue, HITL, team, timer, UI toggles, KB) | ✅ |
+| 12.6 | `services/frontend/src/hooks/useDesktopWebSocket.ts` | socket.io-client hook: connects to `{API_URL}/desktop`; listens handoff:incoming, transcript:update, hitl:approval_required, agent:status_changed; manages call:join/leave transcript room | ✅ |
+| 12.7 | `services/frontend/src/components/desktop/DesktopTopBar.tsx` | Fixed top bar (h-14): status dropdown (5 states + API PUT), active call banner (timer MM:SS + CID + caller), queue count, handled/avg/CSAT stats, live clock, HITL notification bell with badge, avatar | ✅ |
+| 12.8 | `services/frontend/src/components/desktop/QueuePanel.tsx` | Left panel (240px): My Queues summary (oldest wait, count badge), waiting interactions list (caller name/intent, wait time, SLA breach highlight >120s, hover Accept button), empty state, parked calls section | ✅ |
+| 12.9 | `services/frontend/src/components/desktop/ConversationWorkspace.tsx` | Centre panel: idle state illustration; call controls (Hold/Mute/Transfer/Conference/WrapUp/End); AI handoff summary banner; scrollable transcript with role-coloured turns; quick-response bar + canned responses; TransferDialog (queue/agent/external + warm transfer); WrapUpDialog (8 disposition codes + notes) | ✅ |
+| 12.10 | `services/frontend/src/components/desktop/ContextPanel.tsx` | Right panel (320px): 4-tab layout — Caller Info (avatar + fields + AI summary), History (last 10 contacts via API, duration + disposition + agent), Notes (free-text + quick disposition grid), KB Search (debounced 350ms search, relevance score, category badge) | ✅ |
+| 12.11 | `services/frontend/src/components/desktop/HitlApprovalBanner.tsx` | HITL approval banner: per-request card with risk-level colour-coding (critical/high/medium/low), action type + amount, expandable detail (description, CID, created time), supervisor notes textarea, Approve/Reject buttons with API call + store removal | ✅ |
+| 12.12 | `services/frontend/src/components/desktop/SupervisorMonitor.tsx` | Supervisor overlay modal: team grid (agent card with status dot, calls today, avg handle, barge/whisper buttons for active CIDs); wallboard toggle (on-call/available/break/total handled stats); 30s auto-refresh | ✅ |
+| 12.13 | `services/frontend/src/app/agent-desktop/layout.tsx` | Standalone Next.js layout: own QueryClientProvider, no AppShell, full-viewport `h-screen w-screen overflow-hidden` | ✅ |
+| 12.14 | `services/frontend/src/app/agent-desktop/page.tsx` | Page assembly: bootstrap (GET /auth/me → setAgentIdentity, GET /desktop/queue → setQueue); useDesktopWebSocket; 3-panel layout (QueuePanel | ConversationWorkspace + ContextPanel); HitlApprovalBanner above workspace; SupervisorMonitor overlay when isSupervisor | ✅ |
+
+**Key implementation notes:**
+- **Route**: `/agent-desktop` — standalone, no sidebar, no top nav; accessible directly by human agents and supervisors
+- **WebSocket**: NestJS `@WebSocketGateway({ namespace: '/desktop' })` bridges Redis pub/sub to socket.io rooms. Transcript rooms keyed `cid:{CID}` — agent joins on call accept, leaves on call end. No gateway restart needed — Redis psubscribe `transcript:*` picks up all new calls
+- **HITL flow end-to-end**: AI pipeline publishes Kafka `hitl_approval_required` → NestJS HitlController saves to Redis `hitl_pending:{cid}` + publishes `trustnow:hitl:notify` → Desktop Gateway relays to all connected supervisors via socket.io → HitlApprovalBanner shown in workspace + TopBar bell badge → supervisor approves → `POST /hitl/:cid/approve` → NestJS writes `hitl_decision:{cid}` → Python `hitl_service` unblocks polling loop
+- **Call controls**: All actions publish to Redis `trustnow:esl:command` channel; FreeSWITCH ESL consumer (Task 9) processes and executes the command — hold, mute, transfer, barge all flow this way
+- **Socket.io peer deps**: `--legacy-peer-deps` required due to NestJS peer conflict with socket.io v4; added to npm install command
+- **Supervisor-only**: Barge/Whisper/Team Monitor/Wallboard only rendered when `isSupervisor === true` in store
+
+**VERIFY:**
+```bash
+# Desktop module files
+ls services/platform-api/src/desktop/
+ls services/frontend/src/components/desktop/
+ls services/frontend/src/app/agent-desktop/
+
+# NestJS module registered
+grep DesktopModule services/platform-api/src/app.module.ts
+
+# socket.io installed
+node -e "require('@nestjs/websockets'); console.log('OK')" 2>/dev/null
+
+# Zustand store + hook
+ls services/frontend/src/store/desktopStore.ts services/frontend/src/hooks/useDesktopWebSocket.ts
+```
+
+### TASK 13 ← NEXT
+- Analytics & Reporting Layer (BRD §9) — Prerequisite: Task 12 complete ✅
 
 ### [2026-04-11] Task Addendum Blockers — RESOLVED
 | # | Blocker | Status | Notes |

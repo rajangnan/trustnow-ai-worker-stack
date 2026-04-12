@@ -34,6 +34,7 @@ import { EnvVarsModule } from './env-vars/env-vars.module';
 import { TtsModule } from './tts/tts.module';
 import { SttModule } from './stt/stt.module';
 import { AutonomousModule } from './autonomous/autonomous.module';
+import { DesktopModule } from './desktop/desktop.module';
 import { ApiKeyMiddleware } from './common/middleware/api-key.middleware';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
@@ -85,6 +86,8 @@ import { AppController } from './app.controller';
     SttModule,
     // Task 11 — Autonomous AI Workers
     AutonomousModule,
+    // Task 12 — Human Agent Desktop
+    DesktopModule,
   ],
   controllers: [AppController],
   providers: [

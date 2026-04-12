@@ -24,8 +24,10 @@
     "@nestjs/jwt": "^10.2.0",
     "@nestjs/passport": "^10.0.3",
     "@nestjs/platform-express": "^10.4.0",
+    "@nestjs/platform-socket.io": "^11.1.18",
     "@nestjs/schedule": "^6.1.1",
     "@nestjs/swagger": "^7.4.0",
+    "@nestjs/websockets": "^11.1.18",
     "axios": "^1.14.0",
     "bull": "^4.16.5",
     "class-transformer": "^0.5.1",
@@ -40,6 +42,7 @@
     "pg": "^8.13.0",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.1",
+    "socket.io": "^4.8.3",
     "uuid": "^10.0.0"
   },
   "devDependencies": {
