@@ -1,6 +1,7 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import * as net from 'net';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import Redis from 'ioredis';
 
 @Injectable()
 export class EslService extends EventEmitter2 implements OnModuleInit, OnModuleDestroy {
@@ -10,17 +11,33 @@ export class EslService extends EventEmitter2 implements OnModuleInit, OnModuleD
   private buffer = '';
   private readonly ESL_HOST = '127.0.0.1';
   private readonly ESL_PORT = 8021;
+  // Redis pub/sub client — publishes interrupt:{cid} signals to AI pipeline (§9.2)
+  private redisPublisher: Redis;
 
   constructor() {
     super();
+    // Initialise Redis publisher for barge-in interrupt signals — §9.2
+    this.redisPublisher = new Redis({
+      host: process.env.REDIS_HOST || '127.0.0.1',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      password: process.env.REDIS_PASSWORD || undefined,
+      lazyConnect: true,
+    });
+    this.redisPublisher.on('error', (err) => {
+      this.logger.warn(`ESL Redis publisher error: ${err.message}`);
+    });
   }
 
   async onModuleInit() {
+    await this.redisPublisher.connect().catch((err) => {
+      this.logger.warn(`ESL Redis connect failed — barge-in signals disabled: ${err.message}`);
+    });
     await this.connect();
   }
 
   onModuleDestroy() {
     this.disconnect();
+    this.redisPublisher.disconnect();
   }
 
   private async connect(): Promise<void> {
@@ -99,8 +116,18 @@ export class EslService extends EventEmitter2 implements OnModuleInit, OnModuleD
 
     if (message.includes('Event-Name: DETECTED_SPEECH')) {
       const cid = this.extractHeader(message, 'variable_trustnow_cid');
+      // Speech-Duration is in ms — used for 'smart' interrupt mode (≥300ms) — §9.2
+      const speechDurationMs = parseInt(this.extractHeader(message, 'Speech-Duration') || '0', 10);
       if (cid) {
-        this.emit('DETECTED_SPEECH', { cid });
+        // Publish barge-in interrupt signal to Redis — AI pipeline subscribes per active CID
+        const payload = JSON.stringify({
+          speech_duration_ms: speechDurationMs,
+          timestamp: Date.now(),
+        });
+        this.redisPublisher.publish(`interrupt:${cid}`, payload).catch((err) => {
+          this.logger.warn(`interrupt:${cid} Redis publish failed: ${err.message}`);
+        });
+        this.emit('DETECTED_SPEECH', { cid, speechDurationMs });
       }
     }
   }

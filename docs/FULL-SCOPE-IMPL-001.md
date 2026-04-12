@@ -8604,22 +8604,26 @@ done
 
 ### ADDENDUM 7A — FreeSWITCH Outbound SIP Gateway
 
-**Objective:** Configure the FreeSWITCH outbound SIP gateway (`trustnow_trunk`) required by the BatchCallWorker's `originate sofia/gateway/trustnow_trunk/+E164` command. Without this, Addendum 6A batch calling will fail at the FreeSWITCH layer.
+**Objective:** Configure the FreeSWITCH external Sofia SIP profile and the dynamic per-tenant gateway wiring required by the BatchCallWorker's `originate sofia/gateway/{gatewayName}/+E164` command. Without this, BatchCallModule outbound calls fail at the FreeSWITCH layer.
 
-**Context:** Task 7 configured inbound SIP. The co-browsing translation (§6.2N BatchCallModule) requires an outbound gateway. The gateway configuration is dynamically updated by PhoneNumbersModule when a client imports a SIP trunk number. This addendum implements the static framework; the dynamic per-tenant gateway is wired by §6.2M.
+**Context:** Task 7 configured inbound SIP only. The co-browsing translation (§6.2N BatchCallModule) requires an outbound gateway. This addendum implements the static profile framework (Steps 7A.1–7A.2), activates it in the running container (Step 7A.3), wires the dynamic per-phone-number gateway creation into PhoneNumbersService (Step 7A.4), and verifies the full stack (Step 7A.5).
 
 ---
 
-#### Step 7A.1 — Add Sofia outbound SIP profile gateway template
+#### Step 7A.1 — Create the external Sofia SIP profile and gateway directory
 
 ```bash
+source /opt/trustnowailabs/trustnow-ai-worker-stack/config/vault/vault-env.sh
 ROOT=/opt/trustnowailabs/trustnow-ai-worker-stack
 FSDIR=$ROOT/config/freeswitch
 
-# Create an outbound gateway directory for dynamic per-tenant gateways
+# Create directory for dynamic per-phone-number gateway config fragments
 mkdir -p $FSDIR/sip_profiles/external
 
-# Create the external Sofia SIP profile that loads gateway configs
+# Create the external Sofia SIP profile
+# The <gateways> block is intentionally empty here.
+# Individual gateway XML fragments are written by PhoneNumbersService (Step 7A.4)
+# into $FSDIR/sip_profiles/external/*.xml and picked up on rescan.
 cat > $FSDIR/sip_profiles/external.xml << 'EOF'
 <profile name="external">
   <settings>
@@ -8641,78 +8645,227 @@ cat > $FSDIR/sip_profiles/external.xml << 'EOF'
     <param name="pass-callee-id" value="true"/>
   </settings>
   <gateways>
-    <!-- Dynamic gateways are loaded from sip_profiles/external/*.xml -->
-    <!-- Created by PhoneNumbersModule (§6.2M) when a SIP trunk is imported -->
-    <!-- Manually add a test gateway here for verification: -->
-    <!--
-    <gateway name="trustnow_trunk_test">
-      <param name="username" value="REPLACE_WITH_SIP_USER"/>
-      <param name="password" value="REPLACE_WITH_SIP_PASSWORD"/>
-      <param name="proxy" value="REPLACE_WITH_SIP_PROVIDER_HOST"/>
-      <param name="register" value="true"/>
-      <param name="caller-id-in-from" value="true"/>
-    </gateway>
-    -->
+    <!-- DO NOT add static gateways here.                                    -->
+    <!-- Dynamic per-phone-number gateways are written by PhoneNumbersService -->
+    <!-- as individual XML files into sip_profiles/external/                  -->
+    <!-- e.g. sip_profiles/external/tn_{phone_number_id_12chars}.xml          -->
+    <!-- They are activated by: sofia profile external rescan                 -->
   </gateways>
 </profile>
 EOF
 
-echo "External SIP profile created."
+echo "✅ external.xml created at $FSDIR/sip_profiles/external.xml"
+cat $FSDIR/sip_profiles/external.xml
 ```
 
 ---
 
-#### Step 7A.2 — Wire PhoneNumbersModule to create gateway configs via ESL
+#### Step 7A.2 — Include the external profile in the FreeSWITCH master config
 
-In `PhoneNumbersModule` (`§6.2M`), the `POST /phone-numbers` and `PUT /phone-numbers/:id/assign-agent` handlers already call `api reloadxml` via ESL. Extend them to also write a gateway config file before reloading:
+FreeSWITCH's `freeswitch.xml` must reference the external profile directory so it loads on startup and after reloadxml.
+
+```bash
+MASTER_CONFIG=$FSDIR/freeswitch.xml
+
+# Check if external profile is already included
+grep -q "external" $MASTER_CONFIG && echo "Already included — skip" || {
+  # Insert include directive for external profile alongside the internal profile
+  sed -i 's|<X-PRE-PROCESS cmd="include" data="sip_profiles/internal.xml"/>|<X-PRE-PROCESS cmd="include" data="sip_profiles/internal.xml"/>\n    <X-PRE-PROCESS cmd="include" data="sip_profiles/external.xml"/>|' $MASTER_CONFIG
+  echo "✅ external profile include added to freeswitch.xml"
+}
+
+grep "external" $MASTER_CONFIG
+```
+
+---
+
+#### Step 7A.3 — Load the external profile into the running FreeSWITCH container
+
+Creating the file alone does not activate it. This step loads the profile into the already-running container.
+
+```bash
+FS_CONTAINER=$(docker ps -q --filter name=freeswitch)
+
+# Reload XML config so FreeSWITCH reads the new profile file
+docker exec $FS_CONTAINER fs_cli -x "reloadxml"
+# Expected: +OK [XML reloaded]
+
+# Start the external profile (first time — it does not exist yet in sofia's memory)
+docker exec $FS_CONTAINER fs_cli -x "sofia profile external start"
+# Expected: +OK profile external started
+
+# Confirm the profile is now RUNNING
+docker exec $FS_CONTAINER fs_cli -x "sofia status" | grep -E "external|RUNNING"
+# Expected: line showing "external" and "RUNNING"
+
+echo "✅ FreeSWITCH external SIP profile loaded and running"
+```
+
+---
+
+#### Step 7A.4 — Add `upsertFreeSwitchGateway()` to PhoneNumbersService
+
+This method writes a per-phone-number gateway XML fragment and triggers FreeSWITCH to pick it up. It is called from both `createPhoneNumber()` and `updatePhoneNumber()` in `phone-numbers.service.ts` after the DB write succeeds.
+
+**Why per-phone-number (not per-tenant):** A tenant may have multiple SIP trunk numbers from different providers. Each needs its own gateway. Using `phone_number_id` as the key ensures no overwrite collision.
 
 ```typescript
-// In phone-numbers.service.ts — called when a phone number is created/updated
+// services/platform-api/src/phone-numbers/phone-numbers.service.ts
 
-async upsertFreeSwitchGateway(phoneNumber: PhoneNumber): Promise<void> {
-  const gatewayName = `trustnow_tenant_${phoneNumber.tenant_id.replace(/-/g, '_').substring(0, 8)}`;
-  const gatewayPath = `/opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch/sip_profiles/external/${gatewayName}.xml`;
+import * as fs from 'fs';
+import * as path from 'path';
 
-  const gatewayXml = `<include>
+@Injectable()
+export class PhoneNumbersService {
+
+  private readonly GATEWAY_DIR =
+    '/opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch/sip_profiles/external';
+
+  // ... existing constructor and methods ...
+
+  /**
+   * Writes a FreeSWITCH gateway XML fragment for this phone number and
+   * signals FreeSWITCH to rescan. Called after every create/update of a
+   * phone_numbers row that has an outbound_address set.
+   *
+   * Gateway naming: tn_{first 12 chars of phone_number_id, no dashes}
+   * One gateway per phone number — no tenant-level collision risk.
+   */
+  async upsertFreeSwitchGateway(phoneNumber: PhoneNumber): Promise<void> {
+    if (!phoneNumber.outbound_address) return; // no outbound config — skip
+
+    const gatewayName = `tn_${phoneNumber.phone_number_id.replace(/-/g, '').substring(0, 12)}`;
+    const gatewayFile = path.join(this.GATEWAY_DIR, `${gatewayName}.xml`);
+
+    // Retrieve SIP password from Vault (stored there by createPhoneNumber wizard)
+    const sipPassword = phoneNumber.sip_username
+      ? await this.vaultService.getSecret(
+          `trustnow/${phoneNumber.tenant_id}/sip/${phoneNumber.phone_number_id}`
+        )
+      : '';
+
+    const gatewayXml = `<include>
   <gateway name="${gatewayName}">
     <param name="username" value="${phoneNumber.sip_username ?? ''}"/>
-    <param name="password" value="${await this.vaultService.getSecret(`trustnow/${phoneNumber.tenant_id}/sip/${phoneNumber.phone_number_id}`)}"/>
+    <param name="password" value="${sipPassword}"/>
     <param name="proxy" value="${phoneNumber.outbound_address}"/>
     <param name="register" value="${phoneNumber.sip_username ? 'true' : 'false'}"/>
-    <param name="transport" value="${phoneNumber.outbound_transport}"/>
+    <param name="transport" value="${phoneNumber.outbound_transport ?? 'tls'}"/>
     <param name="caller-id-in-from" value="true"/>
   </gateway>
 </include>`;
 
-  require('fs').writeFileSync(gatewayPath, gatewayXml);
-  await this.eslService.sendApiCommand('reloadxml');
-  await this.eslService.sendApiCommand(`sofia profile external rescan`);
+    // Ensure directory exists (idempotent)
+    fs.mkdirSync(this.GATEWAY_DIR, { recursive: true });
+    fs.writeFileSync(gatewayFile, gatewayXml);
+
+    // Trigger FreeSWITCH to pick up the new gateway without full restart
+    await this.eslService.sendApiCommand('reloadxml');
+    await this.eslService.sendApiCommand('sofia profile external rescan');
+  }
+
+  /**
+   * Removes the FreeSWITCH gateway config when a phone number is deleted.
+   */
+  async removeFreeSwitchGateway(phoneNumberId: string): Promise<void> {
+    const gatewayName = `tn_${phoneNumberId.replace(/-/g, '').substring(0, 12)}`;
+    const gatewayFile = path.join(this.GATEWAY_DIR, `${gatewayName}.xml`);
+
+    if (fs.existsSync(gatewayFile)) {
+      fs.unlinkSync(gatewayFile);
+      await this.eslService.sendApiCommand('reloadxml');
+      await this.eslService.sendApiCommand('sofia profile external rescan');
+    }
+  }
 }
+```
+
+**Wire into the service handlers:**
+
+```typescript
+// In createPhoneNumber() — after INSERT to DB:
+await this.upsertFreeSwitchGateway(savedPhoneNumber);
+
+// In updatePhoneNumber() — after UPDATE to DB:
+await this.upsertFreeSwitchGateway(updatedPhoneNumber);
+
+// In deletePhoneNumber() — before or after DB delete:
+await this.removeFreeSwitchGateway(phoneNumberId);
 ```
 
 ---
 
-#### Step 7A.3 — Verification
+#### Step 7A.5 — Rebuild Platform API and verify
+
+After modifying `phone-numbers.service.ts`, rebuild and restart before verification.
 
 ```bash
-# Verify external profile is loaded by FreeSWITCH
-docker exec $(docker ps -q --filter name=freeswitch) \
-  fs_cli -x "sofia status" | grep -i external
-# Expected: external profile listed
+cd /opt/trustnowailabs/trustnow-ai-worker-stack/services/platform-api
 
-# Verify ESL can trigger a gateway rescan
-docker exec $(docker ps -q --filter name=freeswitch) \
-  fs_cli -x "sofia profile external rescan"
-# Expected: "+OK reloading XML"
+# Rebuild
+npm run build 2>&1 | grep -E "error|Error|ERROR" | head -20
+# Expected: 0 lines (zero build errors)
 
-# Verify an originate command is syntactically accepted (will fail at network level — that is expected)
-docker exec $(docker ps -q --filter name=freeswitch) \
-  fs_cli -x "originate sofia/gateway/trustnow_trunk_test/+12025550001 &echo"
-# Expected: any error except "INVALID_PROFILE" — "NO_ROUTE_DESTINATION" or "NORMAL_TEMPORARY_FAILURE" is acceptable
-# (gateway config is correct even if no actual SIP trunk is registered yet)
+# Restart Platform API
+pm2 restart platform-api || sudo systemctl restart trustnow-platform-api
+sleep 5
+
+# ── FreeSWITCH verification ───────────────────────────────────────────────────
+
+FS_CONTAINER=$(docker ps -q --filter name=freeswitch)
+
+# 1. External profile is RUNNING
+docker exec $FS_CONTAINER fs_cli -x "sofia status" | grep -i external
+# Expected: line containing "external" and "RUNNING"
+
+# 2. reloadxml works cleanly
+docker exec $FS_CONTAINER fs_cli -x "reloadxml"
+# Expected: +OK [XML reloaded]
+
+# 3. External profile rescan works
+docker exec $FS_CONTAINER fs_cli -x "sofia profile external rescan"
+# Expected: +OK
+
+# 4. Simulate what BatchCallWorker does: write a test gateway fragment and rescan
+TEST_GW_FILE=/opt/trustnowailabs/trustnow-ai-worker-stack/config/freeswitch/sip_profiles/external/tn_test000000.xml
+cat > $TEST_GW_FILE << 'EOF'
+<include>
+  <gateway name="tn_test000000">
+    <param name="username" value="test"/>
+    <param name="password" value="test"/>
+    <param name="proxy" value="sip.test.example.com"/>
+    <param name="register" value="false"/>
+    <param name="transport" value="tls"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>
+EOF
+
+docker exec $FS_CONTAINER fs_cli -x "reloadxml"
+docker exec $FS_CONTAINER fs_cli -x "sofia profile external rescan"
+
+# 5. Verify test gateway is now registered
+docker exec $FS_CONTAINER fs_cli -x "sofia status gateway tn_test000000"
+# Expected: gateway details shown — NOT "Invalid Profile" or "not found"
+
+# 6. Test originate syntax (will fail at network — that is expected and correct)
+docker exec $FS_CONTAINER fs_cli -x "originate sofia/gateway/tn_test000000/+12025550001 &echo"
+# Expected: NORMAL_TEMPORARY_FAILURE, NO_ROUTE_DESTINATION, or similar network error
+# NOT acceptable: INVALID_PROFILE (means gateway not registered)
+
+# Clean up test gateway
+rm $TEST_GW_FILE
+docker exec $FS_CONTAINER fs_cli -x "reloadxml"
+docker exec $FS_CONTAINER fs_cli -x "sofia profile external rescan"
+
+echo "✅ Addendum 7A complete"
 ```
 
-**✅ Addendum 7A complete when:** `sofia status` shows external profile loaded, `reloadxml` returns +OK, and originate does not return `INVALID_PROFILE`.
+**✅ Addendum 7A complete when:**
+- Step 7A.3: `sofia status` shows external profile RUNNING
+- Step 7A.5: `sofia status gateway tn_test000000` returns gateway details (not "not found")
+- Step 7A.5: originate returns a network error — NOT `INVALID_PROFILE`
+- Step 7A.5: Platform API rebuild returns 0 errors and PM2/systemd shows running
 
 ---
 
@@ -8737,9 +8890,13 @@ Before marking Task Addendum complete and moving to Task 8, verify every item:
 | 6A-3 | All new Kong routes registered | Endpoint smoke tests return 200/404, no 500 |
 | 6A-4 | BatchCallWorker process created as separate worker | `services/platform-api/src/workers/batch-call.worker.ts` exists |
 | 6A-5 | ApiKeyMiddleware registered globally | `POST /agents` with an api-key header but no JWT returns 401 (not 500) |
-| 7A-1 | `sip_profiles/external.xml` created | `cat $ROOT/config/freeswitch/sip_profiles/external.xml` |
-| 7A-2 | FreeSWITCH external profile loaded | `sofia status` shows external profile |
-| 7A-3 | `upsertFreeSwitchGateway()` in PhoneNumbersService | Code present in `phone-numbers.service.ts` |
+| 7A-1 | `sip_profiles/external.xml` created | `cat $ROOT/config/freeswitch/sip_profiles/external.xml` shows profile XML |
+| 7A-2 | `external` include added to `freeswitch.xml` | `grep external $FSDIR/freeswitch.xml` returns the include line |
+| 7A-3 | FreeSWITCH external profile RUNNING | `sofia status` shows external + RUNNING |
+| 7A-4 | `upsertFreeSwitchGateway()` in PhoneNumbersService with correct per-number naming | `phone-numbers.service.ts` contains `tn_${phoneNumber.phone_number_id...}` and `fs.mkdirSync` |
+| 7A-5 | Platform API builds 0 errors after TS changes | `npm run build` output |
+| 7A-6 | Test gateway write → rescan → `sofia status gateway` shows it | Step 7A.5 test gateway check passes |
+| 7A-7 | Originate returns network error — NOT `INVALID_PROFILE` | Step 7A.5 originate test |
 
 **Update RUNBOOK.md:** Mark Task Addendum COMPLETE, then report back to Master Architect. Do NOT start Task 8 until the full checklist above is confirmed.
 

@@ -910,8 +910,33 @@ All 21 new NestJS modules from the CO-BROWSING-DATA-001.md v3.0 translation are 
 
 **Pre-Task 8 prerequisites:** ALL CLEARED ✅
 
-### TASK 9 ← NEXT
-- Conversational AI Agent runtime (turn loop, STT → LLM → TTS, barge-in, session manager)
+### [2026-04-12] TASK 9 — Conversational AI Agent Runtime ✅ COMPLETE
+
+**Spec:** FULL-SCOPE-IMPL-001.md §9.1–§9.9
+
+| Step | File | Description | Status |
+|------|------|-------------|--------|
+| 9.1 | `services/ai-pipeline/session_manager.py` | Path 1 first message (TTS only, no LLM), transcript append, session flush, post-call webhook | ✅ |
+| 9.2 | `services/ai-pipeline/turn_loop.py` | Path 2 STT→RAG→LLM→TTS with per-chunk barge-in, build_llm_messages, play_agent_turn, execute_platform_handoff | ✅ |
+| 9.3 | `services/ai-pipeline/silence_watchdog.py` | 3-tier silence re-prompt (20s/25s/20s), platform_end_call() via ESL, start/reset/cancel task management | ✅ |
+| 9.4 | `services/ai-pipeline/evaluation_service.py` | Post-call evaluation criteria scoring + data collection extraction (LLM-based) | ✅ |
+| 9.5 | `services/platform-api/src/telephony/esl.service.ts` | DETECTED_SPEECH: extract Speech-Duration, Redis publish `interrupt:{cid}` with `speech_duration_ms` | ✅ |
+| 9.6 | `services/ai-pipeline/main.py` | `POST /session/{cid}/start` endpoint (SessionStartRequest), inject Redis+PG into all 4 new modules at startup | ✅ |
+
+**Key implementation notes:**
+- **Path 1** (first message): TTS only — no LLM. `llm_latency_ms: None` in transcript turn §9.5
+- **Barge-in** (§9.2): ESL `Speech-Duration` header → Redis `publish interrupt:{cid}` → `_check_barge_in()` polls pubsub per TTS chunk
+- **Interrupt modes**: `allow` (any speech), `smart` (≥300ms), `none` (no interrupt) — all implemented
+- **Silence watchdog** (§9.3): asyncio background task per session; cancelled on reset; 3 tiers: 20s→25s→20s→`platform_end_call()`
+- **`platform_end_call()`**: calls `POST /api/telephony/hangup` on NestJS → ESL hangup. LLM NEVER ends calls via text
+- **`how_call_ended` values**: `client_ended_call` | `silence_timeout` | `max_duration` | `agent_decision` | `handoff_complete`
+- **Transcript schema** (§9.5): `role`, `text`, `timestamp_s`, `llm_latency_ms`, `tts_latency_ms`, `asr_latency_ms`, `interrupted`
+- **Real-time streaming** (§9.6): every turn published to `transcript:{cid}` Redis pub/sub; `streaming: True` while TTS playing
+- **Speculative turn** (§9.9): `asyncio.create_task(llm_complete(...))` when `vad_confidence > 0.7` (wired in VAD layer)
+- **Post-call pipeline**: evaluation_service runs as background task after flush — non-fatal; results written to PostgreSQL + Redis
+
+### TASK 10 ← NEXT
+- Tools-Assisted AI Agents (BRD §6.2) — Prerequisite: Task 9 complete ✅
 
 ### [2026-04-11] Task Addendum Blockers — RESOLVED
 | # | Blocker | Status | Notes |

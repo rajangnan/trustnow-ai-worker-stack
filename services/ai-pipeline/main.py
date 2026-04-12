@@ -47,6 +47,10 @@ from tts_adapter import (
 )
 from kafka_producers import ConversationEventProducer
 from voice_service import router as voices_router, _set_pg_conn_params
+import session_manager
+import turn_loop
+import silence_watchdog
+import evaluation_service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("trustnow.ai_pipeline")
@@ -113,6 +117,17 @@ async def startup():
     }
     logger.info("PostgreSQL connection params loaded (via PgBouncer :5433)")
     _set_pg_conn_params(_pg_conn_params)
+
+    # Inject shared resources into Task 9 turn-loop modules
+    session_manager.set_redis(_redis)
+    session_manager.set_pg_conn_params(_pg_conn_params)
+    turn_loop.set_redis(_redis)
+    turn_loop.set_pg_conn_params(_pg_conn_params)
+    silence_watchdog.set_redis(_redis)
+    silence_watchdog.set_pg_conn_params(_pg_conn_params)
+    evaluation_service.set_redis(_redis)
+    evaluation_service.set_pg_conn_params(_pg_conn_params)
+    logger.info("Turn-loop modules initialised (session_manager, turn_loop, silence_watchdog, evaluation_service)")
 
 
 @app.on_event("shutdown")
@@ -201,6 +216,42 @@ class RAGResponse(BaseModel):
 
 class SessionStateUpdate(BaseModel):
     fields: dict[str, str]
+
+
+class SessionStartRequest(BaseModel):
+    """
+    Payload sent by NestJS TelephonyModule on CHANNEL_ANSWER ESL event.
+    Triggers Path 1 (first message TTS) and starts the silence watchdog.
+    """
+    channel_uuid: str                    # FreeSWITCH Unique-ID
+    agent_id: str
+    tenant_id: str
+    partition: str = "cloud"             # "cloud" | "onprem"
+    channel: str = "sip"                 # "sip" | "webrtc"
+    language: str = "en"
+    first_message: str = ""
+    system_prompt: str = ""
+    voice_id: Optional[str] = None       # ElevenLabs voice_id (Partition A)
+    piper_model: Optional[str] = None    # Piper model (Partition B)
+    voice_stability: float = 0.65
+    voice_similarity: float = 0.75
+    voice_speed: float = 1.0
+    rag_enabled: bool = False
+    kb_docs_attached: bool = False
+    rag_top_k: int = 5
+    llm_model: str = "gpt-4o-mini"
+    backup_llm_model: Optional[str] = None
+    llm_temperature: float = 0.7
+    llm_max_tokens: int = 512
+    latency_preset: str = "balanced"     # "fast" | "balanced" | "high_quality"
+    interrupt_sensitivity: str = "allow" # "allow" | "smart" | "none"
+    handoff_type: str = "B"
+    handoff_sip_target: Optional[str] = None
+    handoff_message: Optional[str] = None
+    max_duration_value: int = 1800
+    evaluation_criteria_json: list = Field(default_factory=list)
+    data_collection_json: list = Field(default_factory=list)
+    post_call_webhook_url: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,6 +417,35 @@ async def session_state_post(cid: str, body: SessionStateUpdate):
         raise HTTPException(status_code=400, detail="No fields to update")
     await _redis.hset(f"session:{cid}", mapping=body.fields)
     return {"cid": cid, "updated": list(body.fields.keys())}
+
+
+@app.post("/session/{cid}/start")
+async def session_start(cid: str, body: SessionStartRequest):
+    """
+    Session start — called by NestJS TelephonyModule on CHANNEL_ANSWER ESL event.
+    Executes Path 1: synthesises first_message via TTS (no LLM), starts silence watchdog.
+    Returns immediately; audio streaming and watchdog run as background tasks.
+    """
+    logger.info("[%s] POST /session/start — agent=%s tenant=%s channel=%s",
+                cid, body.agent_id, body.tenant_id, body.channel)
+
+    # Build agent_config dict from request body
+    agent_config = body.model_dump()
+    agent_config["agent_id"] = body.agent_id
+    agent_config["tenant_id"] = body.tenant_id
+
+    # Fire-and-forget — start_session runs as background task so this endpoint
+    # returns quickly while audio synthesis happens asynchronously
+    asyncio.create_task(
+        session_manager.start_session(
+            cid=cid,
+            agent_config=agent_config,
+            channel_uuid=body.channel_uuid,
+        ),
+        name=f"start_session:{cid}",
+    )
+
+    return {"cid": cid, "status": "starting", "channel_uuid": body.channel_uuid}
 
 
 @app.post("/session/{cid}/end")
