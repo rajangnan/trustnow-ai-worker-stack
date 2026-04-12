@@ -420,11 +420,16 @@ async def _start_moh(cid: str, channel_uuid: str, internal_token: str) -> None:
 async def _stop_moh(cid: str, channel_uuid: str, internal_token: str) -> None:
     """Stop hold music via Platform API."""
     try:
+        import json as _json
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.delete(
+            await client.request(
+                "DELETE",
                 f"{PLATFORM_API_URL}/api/telephony/moh_stop",
-                json={"cid": cid, "channel_uuid": channel_uuid},
-                headers={"Authorization": f"Bearer {internal_token}"},
+                content=_json.dumps({"cid": cid, "channel_uuid": channel_uuid}),
+                headers={
+                    "Authorization": f"Bearer {internal_token}",
+                    "Content-Type": "application/json",
+                },
             )
     except Exception as exc:
         logger.warning("[%s] progress_tracker: MOH stop failed — %s (non-fatal)", cid, exc)
